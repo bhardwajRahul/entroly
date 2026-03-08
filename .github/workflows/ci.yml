@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust-tests:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: entroly-core
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            entroly-core/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('entroly-core/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run Rust tests
+        run: cargo test --lib 2>&1
+
+  python-lint:
+    name: Python Import Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install mcp fastmcp
+
+      - name: Check imports compile
+        run: |
+          python -c "from entroly.config import EntrolyConfig; print('config ok')"
+          python -c "from entroly.cli import _detect_project_type, _generate_mcp_config; print('cli ok')"
+          python -c "from entroly.auto_index import _should_index, _git_ls_files; print('auto_index ok')"
+        working-directory: entroly
+        env:
+          PYTHONPATH: .

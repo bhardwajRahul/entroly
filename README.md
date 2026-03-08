@@ -1,6 +1,7 @@
 # Entroly
 
 [![PyPI](https://img.shields.io/pypi/v/entroly)](https://pypi.org/project/entroly/)
+[![CI](https://github.com/juyterman1000/entroly/actions/workflows/ci.yml/badge.svg)](https://github.com/juyterman1000/entroly/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/core-Rust%20%2B%20PyO3-orange)](entroly-core/)
 
