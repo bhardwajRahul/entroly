@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use fragment::{ContextFragment, compute_relevance};
 use knapsack::{knapsack_optimize, ScoringWeights};
-use entropy::{information_score, shannon_entropy, normalized_entropy, boilerplate_ratio};
+use entropy::{information_score, shannon_entropy, normalized_entropy, boilerplate_ratio, ngram_jaccard_similarity};
 use dedup::{simhash, hamming_distance, DedupIndex};
 use depgraph::{DepGraph, extract_identifiers};
 use guardrails::{file_criticality, has_safety_signal, TaskType, FeedbackTracker, Criticality, compute_ordering_priority, criticality_boost};
@@ -533,6 +533,42 @@ impl EntrolyEngine {
                 }
             }
 
+            // ── NEW: Compare-Calibrate Post-Selection Dedup ──
+            // Post-Knapsack listwise redundancy filter.
+            // Knapsack selects independently based on individual score. For listwise
+            // diversity, we drop fragments that are highly redundant with already-accepted
+            // fragments in the final context window.
+            let mut final_calibrated_indices: Vec<usize> = Vec::with_capacity(final_indices.len());
+            for &idx in &final_indices {
+                let current_content = &frags[idx].content;
+                let is_pinned = frags[idx].is_pinned;
+                
+                if is_pinned {
+                    final_calibrated_indices.push(idx);
+                    continue;
+                }
+
+                let mut is_redundant = false;
+                for &accepted_idx in &final_calibrated_indices {
+                    let accepted_content = &frags[accepted_idx].content;
+                    
+                    // Use the continuous Jaccard similarity for strict redundancy check
+                    let jaccard = ngram_jaccard_similarity(current_content, accepted_content);
+                    if jaccard > 0.60 {
+                        is_redundant = true;
+                        break;
+                    }
+                }
+
+                if !is_redundant {
+                    final_calibrated_indices.push(idx);
+                } else {
+                    // We drop this fragment. It saves tokens, fulfilling the "tokens_saved" metric.
+                    // The token tracking happens below during the `full_tokens` summation.
+                }
+            }
+            final_indices = final_calibrated_indices;
+
             // ── Pass 3: Skeleton Substitution ──
             // For fragments NOT selected, try to fit their skeletons into
             // remaining budget. This gives the LLM structural awareness of
@@ -759,9 +795,13 @@ impl EntrolyEngine {
                     })
                     .map(|f| {
                         let dist = hamming_distance(query_fp, f.simhash);
+                        let simhash_sim = 1.0 - (dist as f64 / 64.0);
+                        let jaccard_sim = ngram_jaccard_similarity(&query, &f.content);
+                        let hybrid_sim = (simhash_sim + jaccard_sim) / 2.0;
+
                         let fm   = self.feedback.learned_value(&f.fragment_id);
                         let rel  = self.context_scorer.score(
-                            dist,
+                            hybrid_sim,
                             f.recency_score,
                             f.entropy_score,
                             f.frequency_score,
@@ -775,9 +815,13 @@ impl EntrolyEngine {
                 self.fragments.values()
                     .map(|f| {
                         let dist = hamming_distance(query_fp, f.simhash);
+                        let simhash_sim = 1.0 - (dist as f64 / 64.0);
+                        let jaccard_sim = ngram_jaccard_similarity(&query, &f.content);
+                        let hybrid_sim = (simhash_sim + jaccard_sim) / 2.0;
+
                         let fm   = self.feedback.learned_value(&f.fragment_id);
                         let rel  = self.context_scorer.score(
-                            dist,
+                            hybrid_sim,
                             f.recency_score,
                             f.entropy_score,
                             f.frequency_score,
@@ -1690,7 +1734,11 @@ mod tests {
                 let id = engine.fragment_slot_ids.get(slot)?;
                 let f = engine.fragments.get(id)?;
                 let dist = crate::dedup::hamming_distance(query_fp, f.simhash);
-                let rel = engine.context_scorer.score(dist, f.recency_score, f.entropy_score, f.frequency_score, 1.0);
+                let simhash_sim = 1.0 - (dist as f64 / 64.0);
+                let jaccard_sim = ngram_jaccard_similarity(query, &f.content);
+                let hybrid = (simhash_sim + jaccard_sim) / 2.0;
+
+                let rel = engine.context_scorer.score(hybrid, f.recency_score, f.entropy_score, f.frequency_score, 1.0);
                 Some((id.clone(), rel))
             })
             .collect();
@@ -1723,7 +1771,8 @@ mod tests {
         let freq = 0.5;
 
         let scores: Vec<f64> = (0u32..=8).map(|hamming| {
-            scorer.score(hamming * 8, recency, entropy, freq, 1.0)
+            let hybrid_sim = 1.0 - (hamming as f64 / 8.0);
+            scorer.score(hybrid_sim, recency, entropy, freq, 1.0)
         }).collect();
 
         for window in scores.windows(2) {

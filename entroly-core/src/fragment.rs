@@ -69,6 +69,7 @@ impl ContextFragment {
         } else {
             token_count
         };
+        let prototype_id = assign_prototype(&source, &content);
         ContextFragment {
             fragment_id,
             content,
@@ -85,7 +86,7 @@ impl ContextFragment {
             simhash: 0,
             skeleton_content: None,
             skeleton_token_count: None,
-            prototype_id: assign_prototype(&source, &content),
+            prototype_id,
         }
     }
 }
