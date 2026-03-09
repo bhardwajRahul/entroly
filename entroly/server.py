@@ -41,6 +41,7 @@ from .adaptive_pruner import EntrolyPruner, FragmentGuard
 from .provenance import build_provenance, ContextProvenance
 from .multimodal import ingest_image as _mm_image, ingest_diagram as _mm_diagram
 from .multimodal import ingest_voice as _mm_voice, ingest_diff as _mm_diff
+from .long_term_memory import LongTermMemory
 # ── Rust engine import (required) ──────────────────────────────────
 try:
     from entroly_core import EntrolyEngine as RustEngine
@@ -124,6 +125,11 @@ class EntrolyEngine:
         except Exception as e:
             logger.warning(f"Failed to load persistent index: {e}")
 
+        # ── hippocampus Long-Term Memory ──
+        # Cross-session memory powered by hippocampus-sharp-memory (salience-based
+        # Ebbinghaus decay + Kanerva SDM). Gracefully degrades if not installed.
+        self._ltm = LongTermMemory(capacity=10_000)
+
         # GC tuning: increase thresholds to reduce pause frequency.
         # Default (700, 10, 10) causes ~500ms stalls on large heaps.
         # We raise gen0 threshold and manually collect every N turns.
@@ -138,6 +144,8 @@ class EntrolyEngine:
             gc.collect()
 
         self._rust.advance_turn()
+        # Tick hippocampus clock (triggers Ebbinghaus decay on long-term memories)
+        self._ltm.tick()
 
     def ingest_fragment(
         self,
@@ -190,10 +198,50 @@ class EntrolyEngine:
                     "key_terms":         analysis_dict.get("key_terms", []),
                 }
 
+        # ── Long-term memory recall: inject relevant cross-session memories ──
+        ltm_fragments = []
+        if self._ltm.active and refined_query:
+            ltm_results = self._ltm.recall_relevant(refined_query, top_k=5, min_retention=0.2)
+            for mem in ltm_results:
+                # Inject long-term memories as pinned high-priority fragments
+                try:
+                    self._rust.ingest(
+                        mem["content"],
+                        f"ltm:{mem.get('source', 'long_term_memory')}",
+                        0,  # auto-estimate tokens
+                        True,  # pinned — always include
+                    )
+                    ltm_fragments.append(mem)
+                except Exception:
+                    pass
+
         result = self._rust.optimize(token_budget, refined_query)
         result = dict(result)
         if refinement_info:
             result["query_refinement"] = refinement_info
+        if ltm_fragments:
+            result["long_term_memories_injected"] = len(ltm_fragments)
+
+        # ── Auto-remember high-value selected fragments for next session ──
+        if self._ltm.active:
+            selected = result.get("selected", [])
+            if selected:
+                selected_ids = {f.get("id", "") for f in selected if isinstance(f, dict)}
+                frag_dicts = []
+                for f in selected:
+                    if isinstance(f, dict):
+                        frag_dicts.append({
+                            "id": f.get("id", ""),
+                            "content": f.get("preview", ""),
+                            "source": f.get("source", ""),
+                            "entropy_score": 0.5,  # selected = valuable
+                            "is_pinned": f.get("variant", "") == "full",
+                            "relevance": f.get("relevance", 0.0),
+                        })
+                remembered = self._ltm.remember_fragments(frag_dicts, selected_ids)
+                if remembered:
+                    result["long_term_memories_saved"] = remembered
+
         return self._apply_sssl_filtering(result)
 
     def _apply_sssl_filtering(self, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -829,6 +877,13 @@ def create_mcp_server():
         except Exception:
             pass  # Dashboard never fails due to autotune
 
+        # ── 🧠 LONG-TERM MEMORY (cross-session hippocampus integration) ──
+        try:
+            ltm_stats = engine._ltm.stats()
+            dashboard["long_term_memory"] = ltm_stats
+        except Exception:
+            pass  # Dashboard never fails due to LTM
+
         return json.dumps(dashboard, indent=2)
 
 
@@ -1246,6 +1301,53 @@ def create_mcp_server():
             "optimize_for": recipe_content.get("optimize_for", "recall, precision, efficiency"),
             "time_budget_ms": recipe_content.get("time_budget_ms", "500"),
             "available_strategies": ["auto", "balanced", "latency", "monorepo", "quality"],
+        }, indent=2)
+
+    # ── 🧠 Long-Term Memory Tools (powered by hippocampus-sharp-memory) ──
+
+    @mcp.tool()
+    def long_term_memory_status() -> str:
+        """Show long-term memory status and statistics.
+
+        Shows whether cross-session memory is active (requires hippocampus-sharp-memory),
+        how many fragments have been remembered and recalled, episode count,
+        average retention, and consolidation status.
+
+        Long-term memory runs automatically — fragments from successful optimizations
+        are remembered across sessions using salience-based Ebbinghaus decay.
+        """
+        return json.dumps(engine._ltm.stats(), indent=2)
+
+    @mcp.tool()
+    def long_term_memory_recall(query: str, top_k: int = 5) -> str:
+        """Recall relevant long-term memories for a specific query.
+
+        Searches across sessions for fragments that were previously valuable.
+        Uses hippocampus' LSH-based semantic search + salience-weighted decay.
+
+        This is called automatically during optimize_context(), but you can
+        also call it explicitly to check what the engine remembers about a topic.
+
+        Args:
+            query: What to search for (e.g. "payment processing error handling")
+            top_k: Maximum number of memories to return (default: 5)
+        """
+        memories = engine._ltm.recall_relevant(query, top_k=top_k, min_retention=0.1)
+        if not memories:
+            return json.dumps({
+                "memories": [],
+                "note": (
+                    "No relevant long-term memories found. "
+                    + ("Install hippocampus-sharp-memory for cross-session memory."
+                       if not engine._ltm.active
+                       else "Memories build up as you use entroly across sessions.")
+                ),
+            }, indent=2)
+
+        return json.dumps({
+            "memories": memories,
+            "count": len(memories),
+            "note": "These are cross-session memories ranked by relevance × retention.",
         }, indent=2)
 
     return mcp, engine
