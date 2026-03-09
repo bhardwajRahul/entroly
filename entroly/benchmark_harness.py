@@ -107,9 +107,12 @@ def run_benchmark(engine: Any, budget_seconds: float = 10.0) -> Dict[str, Any]:
     eff_block = stats.get("context_efficiency", {})
     ctx_eff = eff_block.get("context_efficiency", 0.0)
 
-    # Penalize timeouts severely
+    # Hard zero for timeouts — no soft penalty.
+    # Any config that exceeds the time budget is immediately disqualified.
+    # This enforces the guarantee: "Entroly optimizes context in under Xms."
+    # The autotuner will never keep a config that's too slow for real-time MCP use.
     if timed_out:
-        ctx_eff = max(0.0, ctx_eff - 0.5)
+        ctx_eff = 0.0
 
     return {
         "context_efficiency": ctx_eff,

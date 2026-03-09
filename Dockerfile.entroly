@@ -1,4 +1,5 @@
 # Stage 1: Build Rust extension — python:3.12 base ensures cp312 wheel ABI match
+# Works on: Linux x86_64, ARM64 (Apple Silicon, AWS Graviton), Windows via Docker Desktop, macOS via Docker Desktop
 FROM python:3.12 AS builder
 
 WORKDIR /build
@@ -21,18 +22,29 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install the cp312 Rust wheel and mcp
+# Install the cp312 Rust wheel, mcp, and psutil (for idle CPU detection in autotune daemon)
 COPY --from=builder /build/wheels/*.whl /tmp/wheels/
-RUN pip install --no-cache-dir /tmp/wheels/*.whl "mcp>=1.0.0" \
+RUN pip install --no-cache-dir /tmp/wheels/*.whl "mcp>=1.0.0" psutil \
     && rm -rf /tmp/wheels
 
-# Copy entroly Python package directly — no hatchling build needed
+# Copy entroly Python package
 COPY entroly/entroly/ /app/entroly/
 COPY entroly/pyproject.toml /app/
+
+# Copy bench (autotune harness + benchmark cases)
+COPY bench/ /app/bench/
+
+# Copy tuning config and strategy recipes
+COPY tuning_config.json /app/
+COPY tuning_strategies/ /app/tuning_strategies/
+
 COPY README.md /app/
 
-# Make the entroly package importable
+# Make entroly and bench importable
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
+# Default: run as MCP server (stdio JSON-RPC)
+# The autotune daemon starts automatically in the background (idle-only, nice+10)
+# On 16GB machines it pauses when you're working — zero impact on dev experience.
 ENTRYPOINT ["python", "-m", "entroly.server"]
