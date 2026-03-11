@@ -14,7 +14,7 @@ When you ask Cursor to "fix the SQL injection bug," it stuffs your context windo
 <div align="center">
   <br/>
 
-  https://github.com/juyterman1000/entroly/raw/main/entroly_demo.mp4
+  https://github.com/juyterman1000/entroly/raw/main/docs/assets/entroly_demo.mp4
 
   <p><i>Live engine metrics from <code>entroly demo</code> — real Rust engine, zero mocks.</i></p>
 </div>

@@ -214,7 +214,7 @@ def cmd_serve(args):
 def cmd_demo(args):
     """entroly demo — show the value of Entroly in 5 seconds."""
     import importlib.util
-    demo_path = Path(__file__).parent.parent / "demo_value.py"
+    demo_path = Path(__file__).parent.parent / "examples" / "demo_value.py"
     if demo_path.exists():
         spec = importlib.util.spec_from_file_location("demo_value", demo_path)
         mod = importlib.util.module_from_spec(spec)
