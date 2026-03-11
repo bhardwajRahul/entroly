@@ -79,7 +79,7 @@ jobs:
           .venv/bin/python -c "from entroly.auto_index import _should_index; print('auto_index ok')"
 
       - name: Run functional test
-        run: .venv/bin/python functional_test.py
+        run: .venv/bin/python tests/functional_test.py
 
       - name: Run Python tests
         run: |
