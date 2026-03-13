@@ -345,8 +345,20 @@ def main():
     elif args.command == "demo":
         cmd_demo(args)
     else:
-        # Default: if no subcommand, run serve (backward compat)
-        cmd_serve(args)
+        # No subcommand given → default to serve (backward compat with MCP clients)
+        if len(sys.argv) == 1:
+            cmd_serve(args)
+        else:
+            print(f"""
+  {C.RED}Unknown command:{C.RESET} {C.BOLD}{sys.argv[1]}{C.RESET}
+
+  {C.GRAY}Available commands:{C.RESET}
+    {C.CYAN}entroly init{C.RESET}        Auto-detect project + AI tool, generate MCP config
+    {C.CYAN}entroly serve{C.RESET}       Start the MCP server
+    {C.CYAN}entroly dashboard{C.RESET}   Show live value metrics
+    {C.CYAN}entroly demo{C.RESET}        See a before/after comparison
+""")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
