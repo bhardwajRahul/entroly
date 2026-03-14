@@ -1,8 +1,36 @@
-# Entroly
+<p align="center">
+  <img src="/home/abby/.gemini/antigravity/brain/58a307f2-9368-4ed7-90ae-e78a6a97c56f/entroly_logo_trending_1773529891239.png" width="200" alt="Entroly Logo">
+</p>
 
-**Information-theoretic context compression for AI coding agents.**
+<h1 align="center">Entroly</h1>
+
+<p align="center">
+  <b>Information-theoretic context compression for AI coding agents.</b>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-Engine-orange?logo=rust" alt="Rust">
+  <img src="https://img.shields.io/badge/Python-3.10+-blue?logo=python" alt="Python">
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/PRs-Welcome-brightgreen" alt="PRs Welcome">
+  <img src="https://img.shields.io/badge/Tests-259%20Passing-success" alt="Tests">
+</p>
+
+---
 
 Every AI coding tool — Cursor, Copilot, Claude Code, Cody — manages context with dumb heuristics: stuff tokens until the window fills, then cut. Entroly uses mathematics to compress an **entire codebase** into the optimal context window.
+
+## 🛑 The Problem
+Current AI tools use **Cosine Similarity** (Vector Search). It's great for finding "things that look like my query," but terrible for coding because:
+1. **Context Blindness**: It finds the "top 5 files" but missed the 6th file that contains the critical interface definition.
+2. **Boilerplate Waste**: 40% of retrieved code is often imports or repetitive boilerplate, wasting expensive tokens.
+3. **Correlation vs Causation**: Vector search finds *related* code, not *causally necessary* code.
+
+## ✅ The Solution: Entroly
+Entroly replaces "dumb search" with **Information-Theoretic Compression**. It treats your context window as a finite resource and uses **Knapsack Optimization** to pack the most "informative" (highest entropy) and "causally relevant" (dependency-linked) fragments.
+
+---
+
 
 ```
 pip install entroly
@@ -93,18 +121,19 @@ Two deployment modes:
 
 Three-level hierarchical codebase compression. The LLM sees **everything** at variable resolution:
 
-```
-L1 (~5% budget):  Skeleton map of EVERY file
-                   "auth.py → AuthService, login, verify_token"
-                   Coverage: 100% of codebase
-
-L2 (~25% budget): Expanded skeletons for dep-graph connected cluster
-                   Full function signatures, class layouts
-                   Coverage: query-connected neighborhood
-
-L3 (~70% budget): Knapsack-optimal fragments at full resolution
-                   Submodular diversity: 3 auth + 1 db + 1 config > 5 auth files
-                   Coverage: most relevant code at full detail
+```mermaid
+graph TD
+    Query["User Query"] --> L1["L1: Skeleton Map (5%)"]
+    Query --> L2["L2: Dependency Cluster (25%)"]
+    Query --> L3["L3: Full Fragments (70%)"]
+    
+    L1 --> C1["Signatures of ALL 1000+ files"]
+    L2 --> C2["Expanded skeletons of related modules"]
+    L3 --> C3["Submodular diversified full code"]
+    
+    C1 --> Context["Optimal Context Window"]
+    C2 --> Context
+    C3 --> Context
 ```
 
 Novel techniques:
