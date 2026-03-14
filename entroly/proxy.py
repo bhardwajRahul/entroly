@@ -179,6 +179,14 @@ class PromptCompilerProxy:
                 "vagueness": vagueness,
             }
 
+        # ── Task classification (used by both EGTC and APA preamble) ──
+        task_type = "Unknown"
+        try:
+            task_info = self.engine._rust.classify_task(user_message)
+            task_type = task_info.get("task_type", "Unknown")
+        except Exception:
+            pass
+
         # ── EGTC v2: Fisher-based Temperature Calibration ──
         optimal_tau = None
         if self.config.enable_temperature_calibration and selected:
@@ -190,13 +198,6 @@ class PromptCompilerProxy:
             # Signal 3: sufficiency — knapsack fill ratio
             total_tokens_used = sum(f.get("token_count", 0) for f in selected)
             sufficiency = min(1.0, total_tokens_used / max(token_budget, 1))
-            # Signal 4: task type from Rust classifier
-            task_type = "Unknown"
-            try:
-                task_info = self.engine._rust.classify_task(user_message)
-                task_type = task_info.get("task_type", "Unknown")
-            except Exception:
-                pass
 
             optimal_tau = compute_optimal_temperature(
                 vagueness=vagueness,
@@ -224,9 +225,14 @@ class PromptCompilerProxy:
                 user_message, top_k=3, min_retention=0.3
             )
 
-        # Format the context block
+        # Format the context block (with APA: task-aware preamble + dedup)
+        apa_kwargs: Dict[str, Any] = {}
+        if self.config.enable_prompt_directives:
+            apa_kwargs["task_type"] = task_type
+            apa_kwargs["vagueness"] = vagueness
         context_text = format_context_block(
-            selected, security_issues, ltm_memories, refinement_info
+            selected, security_issues, ltm_memories, refinement_info,
+            **apa_kwargs,
         )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000

@@ -23,6 +23,7 @@ mod skeleton;
 mod sast;
 mod health;
 mod query;
+mod hierarchical;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -833,6 +834,116 @@ impl EntrolyEngine {
             let result = PyDict::new(py);
             result.set_item("nodes", self.dep_graph.node_count())?;
             result.set_item("edges", self.dep_graph.edge_count())?;
+            Ok(result.into())
+        })
+    }
+
+    /// Hierarchical Context Compression — 3-level codebase compression.
+    ///
+    /// Level 1: Skeleton map of entire codebase (~5% budget)
+    /// Level 2: Expanded skeletons for dep-graph connected cluster (~25%)
+    /// Level 3: Full content of most relevant fragments (~70%)
+    ///
+    /// Novel: symbol-reachability slicing + submodular diversity + PageRank.
+    pub fn hierarchical_compress(&self, token_budget: u32, query: String) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            // Collect all fragments in a stable order
+            let mut frags: Vec<ContextFragment> = self.fragments.values().cloned().collect();
+            frags.sort_by(|a, b| a.fragment_id.cmp(&b.fragment_id));
+
+            if frags.is_empty() {
+                let result = PyDict::new(py);
+                result.set_item("status", "empty")?;
+                result.set_item("level1_map", "")?;
+                result.set_item("level2_cluster", "")?;
+                result.set_item("level3_count", 0)?;
+                return Ok(result.into());
+            }
+
+            // Find query-relevant fragments (by SimHash similarity)
+            let query_hash = dedup::simhash(&query);
+            let mut scored: Vec<(usize, f64)> = frags.iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let dist = dedup::hamming_distance(query_hash, f.simhash);
+                    let sim = (1.0 - dist as f64 / 64.0).max(0.0);
+                    (i, sim)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Top-K most relevant fragment IDs (seed for cluster expansion)
+            let top_k = scored.iter()
+                .take(10)
+                .filter(|(_, sim)| *sim > 0.1)
+                .map(|(i, _)| frags[*i].fragment_id.clone())
+                .collect::<Vec<_>>();
+
+            // Mean entropy for budget allocation
+            let mean_entropy = frags.iter().map(|f| f.entropy_score).sum::<f64>()
+                / frags.len() as f64;
+
+            // Run hierarchical compression
+            let hcc = hierarchical::hierarchical_compress(
+                &frags,
+                &self.dep_graph,
+                &top_k,
+                token_budget,
+                mean_entropy,
+            );
+
+            // Build Python result
+            let result = PyDict::new(py);
+            result.set_item("status", "compressed")?;
+            result.set_item("level1_map", &hcc.level1_map)?;
+            result.set_item("level1_tokens", hcc.budget_used.0)?;
+            result.set_item("level2_cluster", &hcc.level2_cluster)?;
+            result.set_item("level2_tokens", hcc.budget_used.1)?;
+            result.set_item("level3_count", hcc.level3_indices.len())?;
+            result.set_item("level3_tokens", hcc.budget_used.2)?;
+
+            // Coverage stats
+            let coverage = PyDict::new(py);
+            coverage.set_item("level1_files", hcc.coverage.0)?;
+            coverage.set_item("level2_cluster_files", hcc.coverage.1)?;
+            coverage.set_item("level3_full_files", hcc.coverage.2)?;
+            result.set_item("coverage", coverage)?;
+
+            // Total budget utilization
+            let total_used = hcc.budget_used.0 + hcc.budget_used.1 + hcc.budget_used.2;
+            result.set_item("total_tokens", total_used)?;
+            result.set_item("budget_utilization",
+                if token_budget > 0 {
+                    (total_used as f64 / token_budget as f64 * 10000.0).round() / 10000.0
+                } else { 0.0 }
+            )?;
+
+            // Selected L3 fragment details
+            let l3_list = pyo3::types::PyList::empty(py);
+            for &idx in &hcc.level3_indices {
+                let f = &frags[idx];
+                let d = PyDict::new(py);
+                d.set_item("id", &f.fragment_id)?;
+                d.set_item("source", &f.source)?;
+                d.set_item("token_count", f.token_count)?;
+                d.set_item("content", &f.content)?;
+                let preview = if f.content.len() > 100 {
+                    let mut end = 100;
+                    while end < f.content.len() && !f.content.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    format!("{}...", &f.content[..end])
+                } else {
+                    f.content.clone()
+                };
+                d.set_item("preview", preview)?;
+                l3_list.append(d)?;
+            }
+            result.set_item("level3_fragments", l3_list)?;
+
+            // Cluster IDs for debugging
+            result.set_item("cluster_ids", hcc.cluster_ids)?;
+
             Ok(result.into())
         })
     }
