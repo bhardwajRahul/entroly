@@ -37,7 +37,7 @@ dependencies = [
 
 [project.optional-dependencies]
 native = [
-    "entroly-core>=0.2.0",
+    "entroly-core>=0.3.0",
     "mcp>=1.0.0",
 ]
 
