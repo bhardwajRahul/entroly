@@ -1,7 +1,7 @@
 name: Publish entroly-core wheels to PyPI
 
 # Builds native Python wheels and publishes to PyPI on release tags.
-# Covers: Linux x86_64 (manylinux), macOS arm64 (native), Windows x86_64.
+# Linux x86_64 and Windows x86_64 are required; macOS is best-effort.
 
 on:
   push:
@@ -29,17 +29,19 @@ jobs:
   macos:
     name: macOS (arm64)
     runs-on: macos-latest
+    continue-on-error: true   # best-effort; don't block publishing
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build wheel via pipx
+      - name: Build wheel
         run: |
-          pipx run maturin build --release --out ../dist
+          pipx run maturin build --release --out dist
         working-directory: entroly-core
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: wheels-macos
-          path: dist
+          path: entroly-core/dist
 
   windows:
     name: Windows (x86_64)
@@ -59,7 +61,8 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: [linux, macos, windows]
+    # Only requires linux and windows (proven); macOS is continue-on-error above
+    needs: [linux, windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/entroly-v')
     permissions:
