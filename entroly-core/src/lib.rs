@@ -110,6 +110,13 @@ pub struct EntrolyEngine {
     ios_skeleton_info_factor: f64,
     ios_reference_info_factor: f64,
     ios_diversity_floor: f64,
+
+    // Differentiable soft-selector temperature for gradient-based weight learning.
+    // Controls sigmoid sharpness: high τ = soft (smooth gradients), low τ = hard (sharp selection).
+    // Anneals toward 0 over turns so early learning explores, late learning exploits.
+    gradient_temperature: f64,
+    // EMA of gradient L2 norm — used to detect regime changes and reset temperature.
+    gradient_norm_ema: f64,
 }
 
 /// Snapshot of the last optimization for explainability.
@@ -205,6 +212,8 @@ impl EntrolyEngine {
             ios_skeleton_info_factor: ios_skeleton_info_factor.clamp(0.01, 0.99),
             ios_reference_info_factor: ios_reference_info_factor.clamp(0.01, 0.99),
             ios_diversity_floor: ios_diversity_floor.clamp(0.0, 1.0),
+            gradient_temperature: 2.0, // Start soft — anneals via τ *= 0.995 each turn
+            gradient_norm_ema: 0.0,
         }
     }
 
@@ -425,7 +434,7 @@ impl EntrolyEngine {
             // ── Dependency-aware score boosting ──
             // First pass with basic knapsack to discover initial selection,
             // then compute dep boosts from that selection.
-            let result1 = knapsack_optimize(&frags, effective_budget, &weights, &feedback_mults);
+            let result1 = knapsack_optimize(&frags, effective_budget, &weights, &feedback_mults, self.gradient_temperature);
             let initial_selected_ids: HashSet<String> = result1.selected_indices.iter()
                 .map(|&i| frags[i].fragment_id.clone())
                 .collect();
@@ -489,7 +498,7 @@ impl EntrolyEngine {
                 // ── Legacy Path: Standard knapsack + exploration + skeleton pass ──
                 selection_method = "legacy_knapsack";
                 let result = if dep_boosts.values().any(|&b| b > 0.3) {
-                    knapsack_optimize(&boosted_frags, effective_budget, &weights, &feedback_mults)
+                    knapsack_optimize(&boosted_frags, effective_budget, &weights, &feedback_mults, self.gradient_temperature)
                 } else {
                     result1
                 };
@@ -913,6 +922,8 @@ impl EntrolyEngine {
             total_optimizations: u64,
             total_fragments_ingested: u64,
             total_duplicates_caught: u64,
+            gradient_temperature: f64,
+            gradient_norm_ema: f64,
         }
         let snapshot = IndexSnapshot {
             fragments: &self.fragments,
@@ -925,6 +936,8 @@ impl EntrolyEngine {
             total_optimizations: self.total_optimizations,
             total_fragments_ingested: self.total_fragments_ingested,
             total_duplicates_caught: self.total_duplicates_caught,
+            gradient_temperature: self.gradient_temperature,
+            gradient_norm_ema: self.gradient_norm_ema,
         };
         let json = serde_json::to_vec(&snapshot)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
@@ -954,7 +967,12 @@ impl EntrolyEngine {
             total_optimizations: u64,
             total_fragments_ingested: u64,
             total_duplicates_caught: u64,
+            #[serde(default = "default_gradient_temperature")]
+            gradient_temperature: f64,
+            #[serde(default)]
+            gradient_norm_ema: f64,
         }
+        fn default_gradient_temperature() -> f64 { 2.0 }
         let data = std::fs::read(path)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         let snapshot: IndexSnapshot = serde_json::from_slice(&data)
@@ -970,6 +988,8 @@ impl EntrolyEngine {
         self.total_optimizations = snapshot.total_optimizations;
         self.total_fragments_ingested = snapshot.total_fragments_ingested;
         self.total_duplicates_caught = snapshot.total_duplicates_caught;
+        self.gradient_temperature = snapshot.gradient_temperature;
+        self.gradient_norm_ema = snapshot.gradient_norm_ema;
         // Rebuild dedup index from loaded fragments
         for frag in self.fragments.values() {
             self.dedup_index.insert(&frag.fragment_id, &frag.content);
@@ -1389,55 +1409,108 @@ impl EntrolyEngine {
         }
     }
 
-    /// Apply PRISM Anisotropic Spectral Shaping to update the 4 scoring weights.
-    /// This uses the gradient (feedback * feature_value) and dampens it via
-    /// the inverse square root of the 4x4 feature covariance matrix.
-    fn apply_prism_rl_update(&mut self, fragment_ids: &[String], feedback_val: f64) {
-        if fragment_ids.is_empty() { return; }
-        
-        // Sum up the feature gradients for all provided fragments
-        let mut g = [0.0; 4]; // [recency, frequency, semantic, entropy]
-        let mut count = 0.0;
-        
-        for id in fragment_ids {
-            if let Some(f) = self.fragments.get(id) {
-                g[0] += f.recency_score;
-                g[1] += f.frequency_score;
-                g[2] += f.semantic_score;
-                g[3] += f.entropy_score;
-                count += 1.0;
-            }
+    /// Numerically stable sigmoid: σ(x) = 1 / (1 + e^{-x}).
+    /// Clamps input to [-500, 500] to prevent overflow.
+    #[inline]
+    fn sigmoid(x: f64) -> f64 {
+        let x = x.clamp(-500.0, 500.0);
+        if x >= 0.0 {
+            1.0 / (1.0 + (-x).exp())
+        } else {
+            let ex = x.exp();
+            ex / (1.0 + ex)
         }
-        
-        if count == 0.0 { return; }
-        
-        // Average the gradients and multiply by the RL feedback signal
-        for gi in g.iter_mut() {
-            *gi = (*gi / count) * feedback_val;
+    }
+
+    /// Apply PRISM Anisotropic Spectral Shaping with differentiable soft-selector gradients.
+    ///
+    /// Uses REINFORCE-with-baseline policy gradient through a sigmoid relaxation:
+    ///
+    ///   p_i = σ(score_i / τ)                 — soft selection probability
+    ///   advantage_i = (selected_i - p_i) × R  — REINFORCE baseline
+    ///   ∂E[R]/∂w_k = Σ_i  advantage_i · σ'(score_i/τ) · feature_{i,k}
+    ///
+    /// The `(selected - p)` baseline provides proper counterfactual credit assignment:
+    ///   - Selected fragment with low p → large positive advantage (good surprise)
+    ///   - Selected fragment with high p → small advantage (expected)
+    ///   - Unselected fragment with high p → negative advantage (should've been included)
+    ///   - Unselected fragment with low p → ~zero advantage (correctly excluded)
+    ///
+    /// The σ'(score/τ) = p(1-p)/τ term focuses gradient on decision-boundary fragments.
+    ///
+    /// Temperature τ anneals via τ *= 0.995 per update but resets on regime changes
+    /// (gradient norm spike > 3× EMA), allowing re-exploration when the task shifts.
+    ///
+    /// NOTE: The gradient operates on the pre-softcap linear score `w^T · features`,
+    /// not on the post-softcap score used in actual selection. This is intentional:
+    /// softcap is monotone, so pre-softcap optima = post-softcap optima, and the
+    /// linear gradient landscape is better conditioned for optimization.
+    fn apply_prism_rl_update(&mut self, fragment_ids: &[String], reward: f64) {
+        if self.fragments.is_empty() { return; }
+
+        let tau = self.gradient_temperature.max(0.01);
+        let selected: HashSet<&str> = fragment_ids.iter().map(|s| s.as_str()).collect();
+
+        // Compute REINFORCE-with-baseline policy gradient
+        let mut g = [0.0_f64; 4]; // [∂/∂w_r, ∂/∂w_f, ∂/∂w_s, ∂/∂w_e]
+
+        for frag in self.fragments.values() {
+            // Linear score (pre-softcap — see note above)
+            let score = self.w_recency   * frag.recency_score
+                      + self.w_frequency * frag.frequency_score
+                      + self.w_semantic  * frag.semantic_score
+                      + self.w_entropy   * frag.entropy_score;
+
+            let p = Self::sigmoid(score / tau);
+            let dp = p * (1.0 - p) / tau; // sigmoid derivative
+
+            // REINFORCE baseline: advantage = (action - expected_action) × reward
+            // action = 1 if selected, 0 if not
+            // expected_action = p (soft selection probability)
+            let action = if selected.contains(frag.fragment_id.as_str()) { 1.0 } else { 0.0 };
+            let advantage = (action - p) * reward;
+
+            // Accumulate: advantage_i × σ'(score_i/τ) × feature_{i,k}
+            g[0] += advantage * dp * frag.recency_score;
+            g[1] += advantage * dp * frag.frequency_score;
+            g[2] += advantage * dp * frag.semantic_score;
+            g[3] += advantage * dp * frag.entropy_score;
         }
-        
-        // Let the PRISM optimizer compute the anisotropically-damped update step
+
+        // ── Regime change detection ──
+        // If gradient norm spikes >3× the running EMA, the task distribution shifted.
+        // Reset temperature to re-explore the weight space.
+        let g_norm = (g[0]*g[0] + g[1]*g[1] + g[2]*g[2] + g[3]*g[3]).sqrt();
+        if self.gradient_norm_ema > 1e-8 && g_norm > self.gradient_norm_ema * 3.0 {
+            self.gradient_temperature = 2.0; // regime change — re-explore
+        } else {
+            // Normal annealing: τ *= 0.995 each update (soft→hard over ~460 turns)
+            self.gradient_temperature = (self.gradient_temperature * 0.995).max(0.1);
+        }
+        self.gradient_norm_ema = 0.95 * self.gradient_norm_ema + 0.05 * g_norm;
+
+        // Let PRISM compute the anisotropically-damped update: Q Λ^{-1/2} Q^T g
         let update = self.prism_optimizer.compute_update(&g);
-        
+
         // Apply updates to weights
         self.w_recency   += update[0];
         self.w_frequency += update[1];
         self.w_semantic  += update[2];
         self.w_entropy   += update[3];
-        
+
         // Prevent collapse: clamp weights to positive bounds [0.05, 0.8]
         self.w_recency   = self.w_recency.clamp(0.05, 0.8);
         self.w_frequency = self.w_frequency.clamp(0.05, 0.8);
         self.w_semantic  = self.w_semantic.clamp(0.05, 0.8);
         self.w_entropy   = self.w_entropy.clamp(0.05, 0.8);
-        
+
         // Normalize weights so they sum to 1.0 to preserve scoring scale
         let sum = self.w_recency + self.w_frequency + self.w_semantic + self.w_entropy;
         self.w_recency   /= sum;
         self.w_frequency /= sum;
         self.w_semantic  /= sum;
         self.w_entropy   /= sum;
-        
+
         // Update the context scorer with the newly learned decoupled weights
         self.context_scorer.w_similarity = self.w_semantic;
         self.context_scorer.w_recency    = self.w_recency;
@@ -1627,7 +1700,7 @@ fn py_knapsack_optimize(
 ) -> (Vec<ContextFragment>, HashMap<String, f64>) {
     let weights = knapsack::ScoringWeights::default();
     let feedback = HashMap::new();
-    let result = knapsack_optimize(&fragments, token_budget, &weights, &feedback);
+    let result = knapsack_optimize(&fragments, token_budget, &weights, &feedback, 0.0); // hard path for py_knapsack_optimize compatibility
     let selected: Vec<ContextFragment> = result.selected_indices.iter()
         .map(|&i| fragments[i].clone())
         .collect();
