@@ -42,17 +42,29 @@ from .provenance import build_provenance, ContextProvenance
 from .multimodal import ingest_image as _mm_image, ingest_diagram as _mm_diagram
 from .multimodal import ingest_voice as _mm_voice, ingest_diff as _mm_diff
 from .proxy_transform import calibrated_token_count as _calibrated_token_count
-# ── Rust engine import (required) ──────────────────────────────────
+# ── Rust engine import (preferred, 50-100× faster) ─────────────────
 try:
     from entroly_core import EntrolyEngine as RustEngine
     from entroly_core import py_analyze_query, py_refine_heuristic
     _RUST_AVAILABLE = True
-except ImportError as _rust_err:
-    raise ImportError(
-        "entroly_core Rust extension is not installed. "
-        "Run `maturin develop` inside entroly-core/ to build it.\n"
-        f"Original error: {_rust_err}"
-    )
+except ImportError:
+    _RUST_AVAILABLE = False
+    RustEngine = None  # type: ignore[assignment,misc]
+
+    # Provide Python stubs for the Rust query helpers
+    def py_analyze_query(query: str) -> dict:  # type: ignore[misc]
+        """Pure-Python stub when entroly_core is not available."""
+        terms = [w for w in query.lower().split() if len(w) > 2][:8]
+        return {
+            "vagueness_score": 0.5,
+            "key_terms": terms,
+            "needs_refinement": len(terms) < 3,
+            "reason": "python_fallback",
+        }
+
+    def py_refine_heuristic(query: str, context: str) -> str:  # type: ignore[misc]
+        """Pure-Python stub — returns query unchanged."""
+        return query
 
 # Configure logging to stderr (MCP requires stdout for JSON-RPC)
 logging.basicConfig(

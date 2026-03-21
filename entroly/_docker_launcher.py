@@ -53,9 +53,17 @@ def _run_native() -> None:
 def launch() -> None:
     """Main entry point — docker launch or native fallback.
 
-    Supports both MCP mode (default, stdio) and proxy mode (--proxy, port 9377).
-    Auto-updates on every launch by pulling the latest image.
+    Routes CLI subcommands (init, dashboard, health, autotune, benchmark)
+    to the local CLI handler. Only `serve` and bare `entroly` go through
+    Docker (or native fallback).
     """
+
+    # CLI subcommands that don't need Docker or the MCP server
+    _local_commands = {"init", "dashboard", "health", "autotune", "benchmark"}
+    if len(sys.argv) > 1 and sys.argv[1] in _local_commands:
+        from entroly.cli import main as cli_main
+        cli_main()
+        return
 
     # If already inside Docker (or user explicitly opts out), go native
     if os.environ.get("ENTROLY_NO_DOCKER") or os.path.exists("/.dockerenv"):

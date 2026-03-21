@@ -322,6 +322,64 @@ def cmd_autotune(args):
         os.system(f"python3 {os.path.join(os.path.dirname(__file__), '..', 'bench', 'autotune.py')} --iterations {args.iterations}")
 
 
+def cmd_proxy(args):
+    """entroly proxy — start the invisible prompt compiler proxy."""
+    print(f"""
+{C.CYAN}{C.BOLD}  ⚡ Entroly Prompt Compiler Proxy{C.RESET}
+{C.GRAY}  Invisible intelligence layer for any AI coding tool{C.RESET}
+""")
+
+    from entroly.server import EntrolyEngine
+    from entroly.auto_index import auto_index
+    from entroly.proxy import create_proxy_app
+    from entroly.proxy_config import ProxyConfig
+
+    # Load config from environment
+    config = ProxyConfig.from_env()
+    if args.port:
+        config.port = args.port
+    if args.host:
+        config.host = args.host
+    if args.quality is not None:
+        config.quality = args.quality
+        config._apply_quality_dial(args.quality)
+
+    # Initialize engine + auto-index codebase
+    engine = EntrolyEngine()
+    result = auto_index(engine, force=args.force)
+
+    if result["status"] == "indexed":
+        print(f"  {C.GREEN}✅ Indexed {result['files_indexed']} files ({result['total_tokens']:,} tokens) in {result['duration_s']}s{C.RESET}")
+    elif result["status"] == "skipped":
+        print(f"  {C.GRAY}Using persistent index ({result['existing_fragments']} fragments){C.RESET}")
+
+    # Run a warm-up optimize to populate all engine subsystems
+    engine.optimize_context(token_budget=128000, query="project overview")
+
+    # Create the ASGI app (this also starts the dashboard on :9378)
+    app = create_proxy_app(engine, config)
+
+    print(f"""
+  {C.GREEN}{C.BOLD}Proxy live at http://{config.host}:{config.port}{C.RESET}
+  {C.GREEN}{C.BOLD}Dashboard at http://localhost:9378{C.RESET}
+
+  {C.BOLD}To use:{C.RESET} Set your AI tool's API base URL to:
+    {C.CYAN}http://localhost:{config.port}/v1{C.RESET}
+
+  {C.GRAY}Every LLM request is intercepted → optimized (ECC + EGTC + IOS) → forwarded.{C.RESET}
+  {C.GRAY}< 10ms overhead. Press Ctrl+C to stop.{C.RESET}
+""")
+
+    try:
+        import uvicorn
+        uvicorn.run(app, host=config.host, port=config.port, log_level="warning")
+    except ImportError:
+        print(f"  {C.RED}uvicorn not installed. Install with: pip install uvicorn{C.RESET}")
+        print(f"  {C.GRAY}Or run directly: uvicorn entroly.proxy:app --port {config.port}{C.RESET}")
+    except KeyboardInterrupt:
+        print(f"\n  {C.GRAY}Proxy stopped.{C.RESET}")
+
+
 def cmd_benchmark(args):
     """entroly benchmark — run competitive comparison."""
     print(f"\n{C.CYAN}{C.BOLD}  📊 Entroly Competitive Benchmark{C.RESET}\n")
@@ -391,6 +449,28 @@ def main():
         help="Number of optimization iterations (default: 50)",
     )
 
+    # entroly proxy
+    proxy_parser = subparsers.add_parser(
+        "proxy",
+        help="Start the invisible prompt compiler proxy (any IDE)",
+    )
+    proxy_parser.add_argument(
+        "--port", type=int, default=None,
+        help="Proxy port (default: 9377, or ENTROLY_PROXY_PORT)",
+    )
+    proxy_parser.add_argument(
+        "--host", type=str, default=None,
+        help="Bind host (default: 127.0.0.1, or ENTROLY_PROXY_HOST)",
+    )
+    proxy_parser.add_argument(
+        "--quality", type=float, default=None,
+        help="Quality dial 0.0-1.0 (speed→quality). Auto-derives all tuning params.",
+    )
+    proxy_parser.add_argument(
+        "--force", action="store_true",
+        help="Force re-index even if persistent index exists",
+    )
+
     # entroly benchmark
     subparsers.add_parser(
         "benchmark",
@@ -409,6 +489,8 @@ def main():
         cmd_health(args)
     elif args.command == "autotune":
         cmd_autotune(args)
+    elif args.command == "proxy":
+        cmd_proxy(args)
     elif args.command == "benchmark":
         cmd_benchmark(args)
     else:
