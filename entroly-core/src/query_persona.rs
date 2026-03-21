@@ -157,8 +157,8 @@ impl ParticleCloud {
         // Welford mean update
         self.count += 1;
         let n = self.count as f32;
-        for i in 0..dim {
-            self.mean[i] += (x[i] - self.mean[i]) / n;
+        for (i, &xi) in x.iter().enumerate().take(dim) {
+            self.mean[i] += (xi - self.mean[i]) / n;
         }
 
         self.particles.push(x[..dim].to_vec());
@@ -311,8 +311,8 @@ impl QueryArchetype {
 
         // Apply PRISM update to per-archetype weights
         let step = self.prism.compute_update(gradient);
-        for i in 0..4 {
-            self.weights[i] = (self.weights[i] + step[i]).clamp(0.05, 0.60);
+        for (w, &s) in self.weights.iter_mut().zip(step.iter()) {
+            *w = (*w + s).clamp(0.05, 0.60);
         }
         // Normalize weights to sum to 1.0
         let sum: f64 = self.weights.iter().sum();
@@ -498,7 +498,7 @@ impl QueryPersonaManifold {
             a.last_used = self.current_tick;
             a.cloud.add_particle(query_features);
             // Periodically update kernel bandwidth
-            if a.cloud.count % 10 == 0 {
+            if a.cloud.count.is_multiple_of(10) {
                 a.update_kernel();
             }
             (id, weights, false)
