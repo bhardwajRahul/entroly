@@ -7,7 +7,7 @@
 <p align="center">
   <b>Context optimization for AI coding agents.</b>
   <br/>
-  <i>Your AI sees your entire codebase. You pay for 40% fewer tokens. Zero config changes.</i>
+  <i>Your AI sees your entire codebase. You pay for 78% fewer tokens. Zero config changes.</i>
 </p>
 
 <p align="center">
@@ -22,24 +22,36 @@
 
 ---
 
-## What Entroly Does
+## See It In Action
 
-Every AI coding tool — Cursor, Copilot, Claude Code, Cody — stuffs tokens into the context window until it's full, then cuts. This means your AI tool sees 5-10 files and the rest of your codebase is invisible.
+<p align="center">
+  <img src="docs/assets/demo.svg" alt="Entroly Demo — 78% token savings in 8ms" width="800">
+</p>
 
-Entroly fixes this. It compresses your **entire codebase** into the context window at variable resolution, removes duplicate and boilerplate content, and learns which context produces better AI responses over time.
-
-You install it once. It runs invisibly. Your AI gives better answers and you spend less on tokens.
+> **Run it yourself:** `pip install entroly && entroly demo`
+>
+> Open the [interactive HTML demo](docs/assets/demo.html) for the full animated experience, or generate your own with `python docs/generate_demo.py`.
 
 ---
 
-## What You Get
+## The Value
+
+<p align="center">
+  <img src="docs/assets/value.svg" alt="The Entroly Difference — before and after comparison" width="840">
+</p>
+
+Every AI coding tool — Cursor, Copilot, Claude Code, Cody — stuffs tokens into the context window until it's full, then cuts. Your AI sees 5-10 files and the rest of your codebase is invisible.
+
+**Entroly fixes this.** It compresses your entire codebase into the context window at variable resolution, removes duplicates and boilerplate, and learns which context produces better AI responses over time.
+
+You install it once. It runs invisibly. Your AI gives better answers and you spend less on tokens.
 
 | Benefit | Details |
 |---------|---------|
-| **40% fewer tokens per request** | Duplicate code, boilerplate, and low-information content are stripped automatically |
+| **78% fewer tokens per request** | Duplicate code, boilerplate, and low-information content are stripped automatically |
 | **100% codebase visibility** | Every file is represented — critical files in full, supporting files as signatures, peripheral files as references |
 | **AI responses improve over time** | Reinforcement learning adjusts context selection weights from session outcomes — no manual tuning |
-| **Built-in security scanning** | 55 SAST rules catch hardcoded secrets, SQL injection, command injection, and 5 more CWE categories in selected context |
+| **Built-in security scanning** | 55 SAST rules catch hardcoded secrets, SQL injection, command injection, and 5 more CWE categories |
 | **Codebase health grades** | Clone detection, dead symbol finder, god file detection — get an A-F health grade for your project |
 | **< 10ms overhead** | The Rust engine adds under 10ms per request. You won't notice it |
 | **Works with any AI tool** | MCP server for Cursor/Claude Code, or transparent HTTP proxy for anything else |
@@ -102,6 +114,20 @@ Or with Docker Compose: `docker compose up -d`
 
 ---
 
+## How It Works
+
+<p align="center">
+  <img src="docs/assets/pipeline.svg" alt="Entroly Pipeline — 5-stage context optimization" width="880">
+</p>
+
+1. **Ingest** — Auto-indexes your codebase via `git ls-files`, builds dependency graphs, extracts code skeletons, generates SimHash fingerprints for O(1) deduplication
+2. **Score** — Shannon entropy scoring identifies high-information fragments. Query analysis routes each request to a learned archetype via Pitman-Yor process + RBF kernel embedding
+3. **Select** — KKT-optimal knapsack bisection selects the mathematically optimal context subset within budget. Submodular diversity ensures coverage (auth + DB + API, not 3x auth)
+4. **Deliver** — 3-level hierarchical compression: L1 skeleton map (all files), L2 dependency clusters, L3 full fragments. Your AI sees everything at the right resolution
+5. **Learn** — PRISM spectral optimizer updates per-archetype weights from LLM response utilization. Context quality improves with every query
+
+---
+
 ## Platform Support
 
 | | Linux | macOS | Windows |
@@ -132,17 +158,6 @@ Or with Docker Compose: `docker compose up -d`
 | `entroly clean` | Clear cached state and start fresh |
 | `entroly benchmark` | Run competitive benchmark: Entroly vs raw context vs top-K retrieval |
 | `entroly completions` | Generate shell completions for bash, zsh, or fish |
-
----
-
-## How It Works (the short version)
-
-1. **Entroly indexes your codebase** — auto-detects languages, builds dependency graphs, extracts code signatures
-2. **When your AI tool makes a request**, Entroly selects the optimal context — not just "top 5 similar files" but a mathematically optimal subset that maximizes information within the token budget
-3. **Duplicate and boilerplate content is removed** — SimHash fingerprinting detects near-duplicate code in O(1)
-4. **Every file is represented at the right resolution** — critical files get full content, related files get signatures, peripheral files get references
-5. **The system learns from outcomes** — reinforcement learning adjusts selection weights after each session, so context quality improves the more you use it
-6. **Security scanning runs automatically** — 55 SAST rules flag vulnerabilities in selected context before your AI sees them
 
 ---
 
@@ -283,13 +298,13 @@ Hybrid Rust + Python. All math runs in Rust via PyO3 (50-100x faster). MCP proto
 |  |          Entroly Engine (Python)             |          |
 |  |  +-------------------------------------+    |          |
 |  |  |  entroly-core (Rust via PyO3)       |    |          |
-|  |  |  15 modules . 340 KB . 126 tests    |    |          |
+|  |  |  19 modules . 340 KB . 126 tests    |    |          |
 |  |  +-------------------------------------+    |          |
 |  +---------------------------------------------+          |
 +-----------------------------------------------------------+
 ```
 
-## Rust Core (15 modules)
+## Rust Core (19 modules)
 
 | Module | What | How |
 |--------|------|-----|
@@ -306,6 +321,10 @@ Hybrid Rust + Python. All math runs in Rust via PyO3 (50-100x faster). MCP proto
 | **health.rs** | Codebase health | Clone detection, dead symbols, god files, arch violations |
 | **guardrails.rs** | Safety-critical pinning | Criticality levels with task-aware budget multipliers |
 | **query.rs** | Query analysis | Vagueness scoring, keyword extraction, intent classification |
+| **query_persona.rs** | Query archetype discovery | RBF kernel + Pitman-Yor process + per-archetype weights |
+| **anomaly.rs** | Entropy anomaly detection | MAD-based robust Z-scores, grouped by directory |
+| **semantic_dedup.rs** | Semantic redundancy removal | Greedy marginal information gain, (1-1/e) optimal |
+| **utilization.rs** | Response utilization scoring | Trigram + identifier overlap feedback loop |
 | **fragment.rs** | Core data structure | Content, metadata, scoring dimensions, SimHash fingerprint |
 | **lib.rs** | PyO3 bridge | All modules exposed to Python, 126 tests |
 
@@ -347,13 +366,15 @@ Hybrid Rust + Python. All math runs in Rust via PyO3 (50-100x faster). MCP proto
 
 **PRISM** — Natural gradient preconditioning via exact Jacobi eigendecomposition of the 4x4 gradient covariance.
 
+**PSM (Persona Spectral Manifold)** — RBF kernel mean embedding in RKHS for automatic query archetype discovery. Each archetype learns specialized selection weights via Pitman-Yor process.
+
 **ADGT** — Duality gap as a self-regulating temperature signal. No decay constant needed.
 
 **PCNT** — PRISM spectral condition number as a weight-uncertainty-aware temperature modulator.
 
 ## References
 
-Shannon (1948), Charikar (2002), Ebbinghaus (1885), Nemhauser-Wolsey-Fisher (1978), Sviridenko (2004), Boyd & Vandenberghe (Convex Optimization), Williams (1992), LLMLingua (EMNLP 2023), RepoFormer (ICML 2024), FILM-7B (NeurIPS 2024), CodeSage (ICLR 2024).
+Shannon (1948), Charikar (2002), Ebbinghaus (1885), Nemhauser-Wolsey-Fisher (1978), Sviridenko (2004), Boyd & Vandenberghe (Convex Optimization), Williams (1992), Muandet-Fukumizu-Sriperumbudur (2017), LLMLingua (EMNLP 2023), RepoFormer (ICML 2024), FILM-7B (NeurIPS 2024), CodeSage (ICLR 2024).
 
 </details>
 

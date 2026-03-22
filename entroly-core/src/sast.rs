@@ -767,6 +767,21 @@ fn rule_applies(rule: &SastRule, lang: Option<&str>) -> bool {
     }
 }
 
+/// Detect non-code files where structural security rules are meaningless.
+/// Markdown relative links (`../guide.md`), HTML hrefs, CSS paths, etc.
+/// are NOT security vulnerabilities — scanning them produces false positives
+/// that erode trust in the dashboard.
+fn is_non_code_file(source: &str) -> bool {
+    let lower = source.to_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".txt") || lower.ends_with(".rst")
+        || lower.ends_with(".html") || lower.ends_with(".htm")
+        || lower.ends_with(".css") || lower.ends_with(".svg")
+        || lower.ends_with(".xml") || lower.ends_with(".json")
+        || lower.ends_with(".yaml") || lower.ends_with(".yml")
+        || lower.ends_with(".toml") || lower.ends_with(".cfg")
+        || lower.ends_with(".ini") || lower.ends_with(".csv")
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Taint-flow simulation
 /// Inspired by IRIS (ICLR 2025): track user-controlled sources across lines.
@@ -1005,6 +1020,7 @@ fn compute_risk_score(findings: &[SastFinding]) -> f64 {
 /// This is the primary entry point. Call once per `ingest()`.
 pub fn scan_content(content: &str, source: &str) -> SastReport {
     let lang = detect_lang(source);
+    let is_non_code = is_non_code_file(source);
     let lines: Vec<&str> = content.lines().collect();
 
     // Taint analysis (IRIS-inspired): one pass to collect sources, one to propagate
@@ -1026,6 +1042,12 @@ pub fn scan_content(content: &str, source: &str) -> SastReport {
         for rule in RULES {
             // Language filter
             if !rule_applies(rule, lang) {
+                continue;
+            }
+
+            // Non-code files: skip structural rules (path traversal, XSS, etc.)
+            // Keep CWE-798 (hardcoded secrets) — credentials leak in docs too
+            if is_non_code && rule.languages.is_empty() && !rule.taint_aware && rule.cwe != 798 {
                 continue;
             }
 
@@ -1320,5 +1342,36 @@ result = os.system(sanitized)
         // os.system is already flagged unconditionally (CMD-001)
         let report = scan(code, "run.py");
         assert!(report.findings.iter().any(|f| f.rule_id == "CMD-001"));
+    }
+
+    #[test]
+    fn test_path_traversal_not_flagged_in_markdown() {
+        // Markdown relative links are NOT security vulnerabilities
+        let code = "See the [setup guide](../docs/getting-started.md) for details.";
+        let report = scan(code, "README.md");
+        let path_findings: Vec<_> = report.findings.iter()
+            .filter(|f| f.rule_id == "PATH-002")
+            .collect();
+        assert!(path_findings.is_empty(),
+            "PATH-002 should not fire on markdown files (found {} findings)",
+            path_findings.len());
+    }
+
+    #[test]
+    fn test_path_traversal_still_flagged_in_python() {
+        // Python code with ../ IS suspicious
+        let code = r#"path = os.path.join(base, "../../../etc/passwd")"#;
+        let report = scan(code, "handler.py");
+        assert!(report.findings.iter().any(|f| f.rule_id == "PATH-002"),
+            "PATH-002 should still fire on Python files");
+    }
+
+    #[test]
+    fn test_hardcoded_secret_still_flagged_in_markdown() {
+        // Secrets in docs ARE real findings — someone pasted credentials
+        let code = "Example: password = \"hunter2\"";
+        let report = scan(code, "setup.md");
+        assert!(report.findings.iter().any(|f| f.cwe == 798),
+            "Hardcoded secrets should still be flagged in markdown files");
     }
 }

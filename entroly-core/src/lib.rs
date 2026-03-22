@@ -25,6 +25,9 @@ mod health;
 mod query;
 mod hierarchical;
 pub mod query_persona;
+mod anomaly;
+mod utilization;
+mod semantic_dedup;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -1539,7 +1542,52 @@ impl EntrolyEngine {
         })
     }
 
+    /// Scan for entropy anomalies — code that is statistically surprising
+    /// relative to its neighbors. Uses robust Z-scores (MAD) grouped by
+    /// directory. High-entropy spikes = copy-paste errors, unusual patterns.
+    /// Low-entropy drops = dead stubs, placeholders.
+    pub fn entropy_anomalies(&self) -> PyResult<String> {
+        let frags: Vec<&ContextFragment> = self.fragments.values().collect();
+        let report = anomaly::scan_anomalies(&frags);
+        serde_json::to_string(&report).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+        })
+    }
 
+    /// Score how much of the injected context the LLM actually used.
+    /// Call after receiving the LLM response. Measures trigram overlap
+    /// and identifier reuse to determine context efficiency.
+    ///
+    /// Returns JSON with per-fragment scores and session utilization.
+    pub fn score_utilization(&self, response: &str) -> PyResult<String> {
+        // Collect fragments that were most recently selected (used in last optimize())
+        let frags: Vec<&ContextFragment> = self.fragments.values().collect();
+        let report = utilization::score_utilization(&frags, response);
+        serde_json::to_string(&report).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+        })
+    }
+
+    /// Run semantic deduplication on all fragments and report which ones
+    /// are informationally redundant. Returns removal candidates and
+    /// estimated token savings.
+    pub fn semantic_dedup_report(&self) -> PyResult<String> {
+        let frags: Vec<ContextFragment> = self.fragments.values().cloned().collect();
+        if frags.is_empty() {
+            return Ok("{\"kept\": 0, \"removed\": 0, \"tokens_saved\": 0}".into());
+        }
+        let sorted: Vec<usize> = (0..frags.len()).collect();
+        let result = semantic_dedup::semantic_deduplicate_with_stats(&frags, &sorted, None);
+        let report = serde_json::json!({
+            "total_fragments": frags.len(),
+            "kept": result.kept_indices.len(),
+            "removed": result.removed_count,
+            "tokens_saved": result.tokens_saved,
+        });
+        serde_json::to_string(&report).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+        })
+    }
 
     /// Export fragments for checkpoint (returns list of dicts).
     pub fn export_fragments(&self) -> PyResult<PyObject> {

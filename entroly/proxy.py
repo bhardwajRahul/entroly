@@ -988,6 +988,74 @@ async def _toggle_bypass(request: Request) -> JSONResponse:
     })
 
 
+async def _catch_all(request: Request) -> StreamingResponse | JSONResponse:
+    """Transparent catch-all: forward any unmatched path to upstream API.
+
+    IDE clients (Cursor, Continue, Copilot) hit paths like /v1/models,
+    /v1/completions, /v1/engines beyond the two chat endpoints we optimize.
+    Without this, they get a 404 and the user has to work around it.
+
+    This route matches LAST (Starlette matches routes in order), so it
+    only fires for paths not handled by the explicit routes above.
+    """
+    proxy = request.app.state.proxy
+    headers = {k: v for k, v in request.headers.items()}
+    provider = detect_provider(request.url.path, headers)
+    target_url = proxy._resolve_target(provider, request.url.path)
+    forward_headers = proxy._build_headers(headers, provider)
+
+    if request.method == "GET":
+        try:
+            client = await proxy._ensure_client()
+            response = await client.get(target_url, headers=forward_headers)
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return JSONResponse(
+                    content=response.json(),
+                    status_code=response.status_code,
+                )
+            return JSONResponse(
+                content={"data": response.text},
+                status_code=response.status_code,
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"error": "upstream_unavailable", "detail": str(e)},
+                status_code=502,
+            )
+
+    # POST/PUT/DELETE — forward with body
+    body_bytes = await request.body()
+    try:
+        body = json.loads(body_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"error": "invalid request body"}, status_code=400)
+
+    try:
+        client = await proxy._ensure_client()
+        is_streaming = body.get("stream", False) if isinstance(body, dict) else False
+        if is_streaming:
+            return await proxy._stream_response(target_url, forward_headers, body)
+        response = await client.request(
+            request.method, target_url, json=body, headers=forward_headers
+        )
+        content_type = response.headers.get("content-type", "")
+        if "application/json" in content_type:
+            return JSONResponse(
+                content=response.json(),
+                status_code=response.status_code,
+            )
+        return JSONResponse(
+            content={"data": response.text},
+            status_code=response.status_code,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"error": "upstream_unavailable", "detail": str(e)},
+            status_code=502,
+        )
+
+
 async def _proxy_stats(request: Request) -> JSONResponse:
     proxy = request.app.state.proxy
     with proxy._stats_lock:
@@ -1060,6 +1128,9 @@ def create_proxy_app(
             Route("/bypass", _toggle_bypass, methods=["POST"]),    # Gap #28
             Route("/feedback", _fragment_feedback, methods=["POST"]),  # Gap #42
             Route("/explain", _context_explain),                       # Gap #43
+            # Catch-all: forward any unmatched path to upstream API
+            # Must be LAST — Starlette matches routes in declaration order
+            Route("/{path:path}", _catch_all, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]),
         ],
         on_startup=[proxy.startup],
         on_shutdown=[proxy.shutdown],

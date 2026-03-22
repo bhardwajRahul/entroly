@@ -445,7 +445,11 @@ fn extract_definitions(content: &str) -> Vec<String> {
             let fn_idx = parts.iter().position(|&w| w == "function").map(|i| i + 1);
             if let Some(idx) = fn_idx {
                 if let Some(name) = parts.get(idx) {
-                    let clean = name.trim_end_matches('(');
+                    // Split on '(' to get name before params — consistent with
+                    // Python/Rust extraction. Previously used trim_end_matches('(')
+                    // which failed on "App()" because the trailing char is ')'.
+                    let clean = name.split('(').next().unwrap_or(name);
+                    let clean = clean.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
                     if !clean.is_empty() {
                         defs.push(clean.to_string());
                     }
@@ -554,5 +558,20 @@ mod tests {
         let deps = graph.transitive_deps("a", 3);
         assert!(deps.contains(&"b".to_string()));
         assert!(deps.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_extract_definitions_js_function() {
+        // This was the dead-symbol false positive: "function App()" was
+        // registered as "App()" instead of "App", so the reference "App"
+        // (from <App />) didn't match and App was flagged as dead code.
+        let code = "function App() {\n  return <div>Hello</div>;\n}\n\nexport function handleClick(event) {\n  console.log(event);\n}";
+        let defs = extract_definitions(code);
+        assert!(defs.contains(&"App".to_string()),
+            "function App() should extract 'App', got: {:?}", defs);
+        assert!(!defs.iter().any(|d| d.contains('(')),
+            "No definition should contain parentheses, got: {:?}", defs);
+        assert!(defs.contains(&"handleClick".to_string()),
+            "export function handleClick() should extract 'handleClick'");
     }
 }
