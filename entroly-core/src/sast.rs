@@ -1104,13 +1104,29 @@ pub fn scan_content(content: &str, source: &str) -> SastReport {
                 continue;
             }
 
+            // Privacy: redact line content for secret-category findings
+            // so that actual credentials are never exposed in SAST reports.
+            let safe_content = if rule.category == "Hardcoded Secrets" {
+                let trimmed = line.trim();
+                if let Some(eq_pos) = trimmed.find('=') {
+                    // Show key name but redact value: "api_key = [REDACTED]"
+                    format!("{}= [REDACTED]", &trimmed[..eq_pos])
+                } else if trimmed.len() > 30 {
+                    format!("{}...[REDACTED]", &trimmed[..20])
+                } else {
+                    "[REDACTED — secret detected]".to_string()
+                }
+            } else {
+                line.trim().to_string()
+            };
+
             findings.push(SastFinding {
                 rule_id:     rule.id.to_string(),
                 cwe:         rule.cwe,
                 severity:    rule.severity,
                 category:    rule.category.to_string(),
                 line_number,
-                line_content: line.trim().to_string(),
+                line_content: safe_content,
                 confidence,
                 description: rule.description.to_string(),
                 fix:         rule.fix.to_string(),
@@ -1169,6 +1185,54 @@ mod tests {
         assert!(!report.findings.is_empty(), "Should flag hardcoded password");
         assert_eq!(report.findings[0].severity, Severity::Critical);
         assert_eq!(report.findings[0].rule_id, "SEC-001");
+    }
+
+    #[test]
+    fn test_hardcoded_secret_redacted_in_line_content() {
+        // Verify that the actual secret value is NEVER exposed in line_content
+        let code = "password = \"hunter2\"";
+        let report = scan(code, "auth.py");
+        let finding = &report.findings[0];
+        assert!(finding.line_content.contains("[REDACTED]"),
+            "Secret-category finding must redact line_content, got: {}",
+            finding.line_content);
+        assert!(!finding.line_content.contains("hunter2"),
+            "Actual secret value must not appear in line_content: {}",
+            finding.line_content);
+        // Should still show the key name for debugging
+        assert!(finding.line_content.contains("password"),
+            "Key name should be preserved for context: {}",
+            finding.line_content);
+    }
+
+    #[test]
+    fn test_openai_key_redacted_not_leaked() {
+        let code = r#"client = openai.Client(api_key="sk-proj-abc123xyz")"#;
+        let report = scan(code, "llm.py");
+        let sec003 = report.findings.iter().find(|f| f.rule_id == "SEC-003");
+        assert!(sec003.is_some(), "Should detect sk- prefix");
+        let finding = sec003.unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        // Verify actual key is NOT in the finding
+        assert!(!finding.line_content.contains("sk-proj-abc123xyz"),
+            "API key must not appear in SAST finding: {}",
+            finding.line_content);
+        assert!(finding.line_content.contains("[REDACTED]"),
+            "Finding must contain [REDACTED]: {}",
+            finding.line_content);
+    }
+
+    #[test]
+    fn test_non_secret_finding_preserves_line_content() {
+        // SQL injection findings should NOT redact — they're not secrets
+        let code = r#"cursor.execute("SELECT * FROM users WHERE id=" + user_id)"#;
+        let report = scan(code, "db.py");
+        let sqli = report.findings.iter().find(|f| f.category == "SQL Injection");
+        if let Some(finding) = sqli {
+            assert!(!finding.line_content.contains("[REDACTED]"),
+                "Non-secret findings should preserve full line content: {}",
+                finding.line_content);
+        }
     }
 
     #[test]

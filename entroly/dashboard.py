@@ -506,24 +506,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress access logs
 
+    def _send_security_headers(self):
+        """Add security headers to prevent clickjacking and MIME sniffing."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'")
+        self.send_header("Referrer-Policy", "no-referrer")
+
     def do_GET(self):
         if self.path == "/" or self.path == "/dashboard":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(DASHBOARD_HTML.encode())
         elif self.path == "/api/metrics":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Origin", "http://localhost:9378")
             self.send_header("Cache-Control", "no-cache")
+            self._send_security_headers()
             self.end_headers()
             snap = _get_full_snapshot()
             self.wfile.write(json.dumps(snap, default=str).encode())
         elif self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self._send_security_headers()
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
         else:

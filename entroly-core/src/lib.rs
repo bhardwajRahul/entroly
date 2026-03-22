@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use fragment::{ContextFragment, compute_relevance};
 use knapsack::{knapsack_optimize, compute_lambda_star, ScoringWeights};
 use knapsack_sds::{ios_select, Resolution, InfoFactors};
-use entropy::{information_score, shannon_entropy, normalized_entropy, boilerplate_ratio};
+use entropy::{information_score, shannon_entropy, normalized_entropy, boilerplate_ratio, renyi_entropy_2, entropy_divergence};
 use dedup::{simhash, hamming_distance, DedupIndex};
 use depgraph::{DepGraph, extract_identifiers};
 use guardrails::{file_criticality, has_safety_signal, TaskType, FeedbackTracker, Criticality, compute_ordering_priority};
@@ -1895,6 +1895,20 @@ fn py_boilerplate_ratio(text: &str) -> f64 {
     boilerplate_ratio(text)
 }
 
+/// Compute Rényi entropy of order 2 (collision entropy).
+/// More sensitive to concentrated probability mass than Shannon entropy.
+#[pyfunction]
+fn py_renyi_entropy_2(text: &str) -> f64 {
+    renyi_entropy_2(text)
+}
+
+/// Shannon–Rényi divergence: H₁(X) - H₂(X).
+/// High divergence indicates noise or encoded data, not useful context.
+#[pyfunction]
+fn py_entropy_divergence(text: &str) -> f64 {
+    entropy_divergence(text)
+}
+
 /// Compute 64-bit SimHash fingerprint.
 #[pyfunction]
 fn py_simhash(text: &str) -> u64 {
@@ -2025,6 +2039,8 @@ fn entroly_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_shannon_entropy, m)?)?;
     m.add_function(wrap_pyfunction!(py_normalized_entropy, m)?)?;
     m.add_function(wrap_pyfunction!(py_boilerplate_ratio, m)?)?;
+    m.add_function(wrap_pyfunction!(py_renyi_entropy_2, m)?)?;
+    m.add_function(wrap_pyfunction!(py_entropy_divergence, m)?)?;
     m.add_function(wrap_pyfunction!(py_cross_fragment_redundancy, m)?)?;
     m.add_function(wrap_pyfunction!(py_simhash, m)?)?;
     m.add_function(wrap_pyfunction!(py_hamming_distance, m)?)?;

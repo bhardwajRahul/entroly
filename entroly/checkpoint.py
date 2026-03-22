@@ -41,6 +41,7 @@ References:
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -87,11 +88,18 @@ class Checkpoint:
     """Performance stats at checkpoint time."""
 
 
-def _fragment_to_dict(frag: ContextFragment) -> Dict[str, Any]:
-    """Serialize a ContextFragment to a JSON-safe dict."""
-    return {
+def _fragment_to_dict(frag: ContextFragment, include_content: bool = True) -> Dict[str, Any]:
+    """Serialize a ContextFragment to a JSON-safe dict.
+
+    Args:
+        include_content: If False, store only a SHA-256 content hash instead
+            of raw source code.  This prevents user code from persisting on
+            disk in plaintext while still allowing dedup verification on
+            restore.  Content can be re-read from the filesystem via
+            ``source`` (the file path) when the checkpoint is loaded.
+    """
+    d: Dict[str, Any] = {
         "fragment_id": frag.fragment_id,
-        "content": frag.content,
         "token_count": frag.token_count,
         "source": frag.source,
         "recency_score": round(frag.recency_score, 6),
@@ -104,6 +112,14 @@ def _fragment_to_dict(frag: ContextFragment) -> Dict[str, Any]:
         "is_pinned": frag.is_pinned,
         "simhash": frag.simhash,
     }
+    if include_content:
+        d["content"] = frag.content
+    else:
+        # Store only a hash — enough to verify integrity on reload,
+        # but impossible to reconstruct original source from.
+        d["content_hash"] = hashlib.sha256(frag.content.encode()).hexdigest()
+        d["content"] = ""  # empty sentinel; re-read from source on restore
+    return d
 
 
 def _dict_to_fragment(d: Dict[str, Any]) -> ContextFragment:
@@ -230,7 +246,12 @@ class CheckpointManager:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.auto_interval = auto_interval
         self.max_checkpoints = max_checkpoints
-        self.instance_id = instance_id or f"{socket.gethostname()}_{os.getpid()}"
+        if instance_id:
+            self.instance_id = instance_id
+        else:
+            # Hash hostname to avoid leaking machine identity in checkpoint files
+            host_hash = hashlib.sha256(socket.gethostname().encode()).hexdigest()[:12]
+            self.instance_id = f"{host_hash}_{os.getpid()}"
 
         self._tool_calls_since_checkpoint = 0
         self._total_checkpoints_created = 0
@@ -241,6 +262,31 @@ class CheckpointManager:
             os.chmod(str(self.checkpoint_dir), 0o700)
         except OSError:
             pass  # Best-effort on platforms without chmod
+
+        # Security: verify directory is not a symlink (prevents symlink attacks)
+        if os.path.islink(str(self.checkpoint_dir)):
+            import logging as _log
+            _log.getLogger("entroly.checkpoint").warning(
+                "Checkpoint directory is a symlink — refusing to use: %s",
+                self.checkpoint_dir,
+            )
+            # Fall back to a safe temporary directory
+            self.checkpoint_dir = Path(tempfile.mkdtemp(prefix="entroly_ckpt_"))
+            os.chmod(str(self.checkpoint_dir), 0o700)
+
+        # Security: on POSIX, verify we own the directory
+        try:
+            dir_stat = os.stat(str(self.checkpoint_dir))
+            if hasattr(os, "getuid") and dir_stat.st_uid != os.getuid():
+                import logging as _log
+                _log.getLogger("entroly.checkpoint").warning(
+                    "Checkpoint directory not owned by current user (uid=%d, dir_uid=%d)",
+                    os.getuid(), dir_stat.st_uid,
+                )
+                self.checkpoint_dir = Path(tempfile.mkdtemp(prefix="entroly_ckpt_"))
+                os.chmod(str(self.checkpoint_dir), 0o700)
+        except OSError:
+            pass  # Best-effort; Windows may not support uid checks
 
     def should_auto_checkpoint(self) -> bool:
         """Check if an auto-checkpoint is due."""
@@ -266,11 +312,15 @@ class CheckpointManager:
         meta = metadata or {}
         meta["instance_id"] = self.instance_id
 
+        # Privacy: strip raw code content from checkpoints when requested.
+        # Default is True (include content) for backward compat; set
+        # ENTROLY_STRIP_CONTENT=1 to store only content hashes.
+        include_content = os.environ.get("ENTROLY_STRIP_CONTENT", "") not in ("1", "true", "yes")
         checkpoint = Checkpoint(
             checkpoint_id=checkpoint_id,
             timestamp=time.time(),
             current_turn=current_turn,
-            fragments=[_fragment_to_dict(f) for f in fragments],
+            fragments=[_fragment_to_dict(f, include_content=include_content) for f in fragments],
             dedup_fingerprints={k: v for k, v in dedup_fingerprints.items()},
             co_access_data={
                 k: dict(v) for k, v in co_access_data.items()

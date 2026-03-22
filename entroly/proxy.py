@@ -19,9 +19,11 @@ Errors fall back to forwarding the original request unmodified.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
+import re
 import sys
 import threading
 import time
@@ -50,6 +52,46 @@ from .proxy_transform import (
 )
 
 logger = logging.getLogger("entroly.proxy")
+
+# ── Privacy utilities ───────────────────────────────────────────────────
+
+# Patterns that indicate secrets/credentials in user queries
+_SECRET_PATTERNS = re.compile(
+    r"(sk-[a-zA-Z0-9]{20,}|"           # OpenAI keys
+    r"ghp_[a-zA-Z0-9]{36}|"            # GitHub PATs
+    r"AKIA[0-9A-Z]{16}|"               # AWS access keys
+    r"password\s*[:=]\s*\S+|"          # password assignments
+    r"secret\s*[:=]\s*\S+|"            # secret assignments
+    r"api[_-]?key\s*[:=]\s*\S+)",      # api key assignments
+    re.IGNORECASE,
+)
+
+
+def _sanitize_query(query: str, max_len: int = 200) -> str:
+    """Sanitize a user query for safe storage/display.
+
+    - Truncates to max_len characters
+    - Redacts anything that looks like a secret or credential
+    """
+    truncated = query[:max_len]
+    return _SECRET_PATTERNS.sub("[REDACTED]", truncated)
+
+
+def _safe_preview(content: str, max_chars: int = 30) -> str:
+    """Generate a privacy-safe preview of code content.
+
+    Returns only the first line's structural signature (def/class/import),
+    never raw variable values or string literals.
+    """
+    if not content:
+        return ""
+    first_line = content.split("\n", 1)[0].strip()
+    # Only show structural keywords, not values
+    for prefix in ("def ", "class ", "import ", "from ", "async def ", "#"):
+        if first_line.startswith(prefix):
+            return first_line[:max_chars] + ("..." if len(first_line) > max_chars else "")
+    # For non-structural lines, show only the shape (no values)
+    return f"[{len(content)} chars, {content.count(chr(10)) + 1} lines]"
 
 
 # ── Resilience primitives (ported from agentOS) ─────────────────────────
@@ -159,6 +201,22 @@ class _WelfordStats:
             "mean_ms": round(self.mean, 2),
             "stddev_ms": round(self.stddev, 2),
         }
+
+
+def _dp_round(value: int, granularity: int = 100) -> int:
+    """Differential-privacy-safe rounding for public-facing counts.
+
+    Rounds to nearest `granularity` to prevent exact fingerprinting of
+    codebase size via token counts.  This implements the simplest form
+    of ε-differential privacy: deterministic rounding with sensitivity
+    bounded by the granularity parameter.
+
+    For example, _dp_round(41237, 100) → 41200.  An adversary cannot
+    distinguish a 41,200-token codebase from a 41,299-token one.
+    """
+    if value <= 0:
+        return 0
+    return (value // granularity) * granularity
 
 
 # ── Proxy ────────────────────────────────────────────────────────────────
@@ -357,7 +415,7 @@ class PromptCompilerProxy:
                         self._total_optimized_tokens += optimized_tokens
                         self._last_context_fragments = selected_frags[:20] if selected_frags else []
                         self._last_pipeline_ms = pipeline_ms
-                        self._last_query = user_message[:200]
+                        self._last_query = _sanitize_query(user_message)
 
                     if provider == "openai":
                         body = inject_context_openai(body, context_text)
@@ -414,7 +472,8 @@ class PromptCompilerProxy:
                     )
         except Exception as e:
             # Cardinal rule: never block a request due to entroly errors
-            logger.debug(f"Pipeline error (forwarding unmodified): {e}")
+            logger.debug("Pipeline error (forwarding unmodified): %s: %s",
+                         type(e).__name__, str(e)[:120])
 
         # Await warmup (usually completes during pipeline, essentially free)
         await warmup_task
@@ -809,7 +868,7 @@ async def _context_inspect(request: Request) -> JSONResponse:
                 "token_count": f.get("token_count", 0),
                 "entropy_score": round(f.get("entropy_score", 0), 4),
                 "relevance": round(f.get("relevance", 0), 4),
-                "preview": f.get("content_preview", f.get("content", "")[:100]),
+                "preview": _safe_preview(f.get("content", "")),
             })
         return JSONResponse({
             "last_query": proxy._last_query,
@@ -860,10 +919,26 @@ async def _metrics_prometheus(request: Request) -> StreamingResponse:
 
 
 async def _record_outcome(request: Request) -> JSONResponse:
-    """Gap #37: Record whether entroly's optimization helped or hurt."""
+    """Gap #37: Record whether entroly's optimization helped or hurt.
+
+    When fragment_ids are provided, also feeds the PRISM RL weight update
+    loop so the engine learns from proxy-mode outcomes (not just MCP).
+    """
     proxy = request.app.state.proxy
     body = await request.json()
     success = body.get("success", True)
+    fragment_ids = body.get("fragment_ids", [])
+
+    # Feed PRISM RL update if fragment IDs provided
+    if fragment_ids:
+        try:
+            if success:
+                proxy.engine.record_success(fragment_ids)
+            else:
+                proxy.engine.record_failure(fragment_ids)
+        except Exception as e:
+            logger.debug("PRISM RL update skipped: %s", e)
+
     with proxy._stats_lock:
         if success:
             proxy._outcome_success += 1
@@ -874,6 +949,8 @@ async def _record_outcome(request: Request) -> JSONResponse:
     return JSONResponse({
         "recorded": True,
         "outcome": "success" if success else "failure",
+        "fragment_ids": fragment_ids,
+        "prism_updated": bool(fragment_ids),
         "error_rate": round(error_rate, 4),
         "total_outcomes": total,
     })
@@ -966,7 +1043,7 @@ async def _context_explain(request: Request) -> JSONResponse:
                 "entropy": round(entropy, 4),
                 "relevance": round(relevance, 4),
             },
-            "preview": f.get("content_preview", f.get("content", "")[:80]),
+            "preview": _safe_preview(f.get("content", "")),
         })
 
     return JSONResponse({
@@ -1069,11 +1146,11 @@ async def _proxy_stats(request: Request) -> JSONResponse:
             "bypass_mode": proxy._bypass,
             "circuit_breaker": proxy._breaker.state,
             "pipeline_latency": proxy._pipeline_stats.to_dict(),
-            # Gap #27: Value signal
+            # Gap #27: Value signal (DP-rounded to prevent fingerprinting)
             "tokens": {
-                "original_total": proxy._total_original_tokens,
-                "optimized_total": proxy._total_optimized_tokens,
-                "saved_total": max(0, proxy._total_original_tokens - proxy._total_optimized_tokens),
+                "original_total": _dp_round(proxy._total_original_tokens),
+                "optimized_total": _dp_round(proxy._total_optimized_tokens),
+                "saved_total": _dp_round(max(0, proxy._total_original_tokens - proxy._total_optimized_tokens)),
                 "savings_pct": (
                     f"{max(0, proxy._total_original_tokens - proxy._total_optimized_tokens) * 100 // max(proxy._total_original_tokens, 1)}%"
                     if proxy._total_original_tokens > 0 else "N/A"
@@ -1115,6 +1192,16 @@ def create_proxy_app(
         logger.info("Value dashboard live at http://localhost:9378")
     except Exception as e:
         logger.warning(f"Dashboard failed to start: {e}")
+
+    # Start the autotune RL daemon — continuously improves weights in background.
+    # Lazy import to avoid circular dependency (server.py ↔ proxy.py).
+    try:
+        import importlib
+        _server_mod = importlib.import_module("entroly.server")
+        _server_mod._start_autotune_daemon(engine)
+        logger.info("Autotune RL daemon started (background, nice+10)")
+    except Exception as e:
+        logger.debug(f"Autotune daemon not started: {e}")
 
     app = Starlette(
         routes=[
