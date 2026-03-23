@@ -21,7 +21,19 @@ from __future__ import annotations
 import logging
 from typing import Callable, List, Optional
 
-from entroly_core import py_analyze_query, py_refine_heuristic
+try:
+    from entroly_core import py_analyze_query, py_refine_heuristic
+except ImportError:
+    def py_analyze_query(query: str, summaries: list) -> tuple:  # type: ignore[misc]
+        """Pure-Python fallback for query analysis."""
+        terms = [w for w in query.lower().split() if len(w) > 2][:8]
+        vagueness = max(0.0, min(1.0, 1.0 - len(terms) / 8.0))
+        needs_refinement = vagueness > 0.45
+        return (vagueness, terms, needs_refinement, "python_fallback")
+
+    def py_refine_heuristic(query: str, summaries: list) -> str:  # type: ignore[misc]
+        """Pure-Python fallback — returns query unchanged."""
+        return query
 
 logger = logging.getLogger(__name__)
 

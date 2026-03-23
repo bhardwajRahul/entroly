@@ -19,6 +19,7 @@ Errors fall back to forwarding the original request unmodified.
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import logging
@@ -327,8 +328,8 @@ class PromptCompilerProxy:
         # Per-client trajectory isolation: each API key / auth header gets
         # its own turn counter. Prevents concurrent IDE clients from
         # corrupting each other's EGTC temperature calibration.
-        self._trajectory_turns: Dict[str, int] = {}  # client_key -> turn_count
-        self._trajectory_max_clients = 1000  # evict oldest beyond this
+        self._trajectory_turns: collections.OrderedDict[str, int] = collections.OrderedDict()
+        self._trajectory_max_clients = 1000  # evict LRU beyond this
 
         # Gap #29: Last optimization context (for transparency endpoint)
         self._last_context_fragments: list = []
@@ -548,11 +549,12 @@ class PromptCompilerProxy:
                             self._temperature_sum += optimal_tau
                             self._temperature_count += 1
                             self._last_temperature = optimal_tau
+                            # Move to end on access (LRU tracking)
                             self._trajectory_turns[client_key] = self._trajectory_turns.get(client_key, 0) + 1
-                            # Evict oldest clients to prevent unbounded memory growth
-                            if len(self._trajectory_turns) > self._trajectory_max_clients:
-                                oldest = min(self._trajectory_turns, key=self._trajectory_turns.get)
-                                del self._trajectory_turns[oldest]
+                            self._trajectory_turns.move_to_end(client_key)
+                            # Evict least-recently-used clients to prevent unbounded memory growth
+                            while len(self._trajectory_turns) > self._trajectory_max_clients:
+                                self._trajectory_turns.popitem(last=False)
 
                     with self._stats_lock:
                         self._requests_optimized += 1
@@ -821,6 +823,7 @@ class PromptCompilerProxy:
             except Exception as e:
                 self._breaker.record_failure()
                 logger.warning(f"Unexpected stream error: {e}")
+                yield f'data: {{"error": "stream_error"}}\n\n'.encode()
 
         resp_headers = {
             "Cache-Control": "no-cache",
@@ -875,7 +878,10 @@ class PromptCompilerProxy:
 
             # Retry on 429 (rate limit) and 5xx (server errors)
             if response.status_code == 429 or response.status_code >= 500:
-                retry_after = float(response.headers.get("retry-after", str(1.0 * (attempt + 1))))
+                try:
+                    retry_after = float(response.headers.get("retry-after", str(1.0 * (attempt + 1))))
+                except (ValueError, TypeError):
+                    retry_after = 1.0 * (attempt + 1)
                 if attempt < max_retries:
                     logger.info(
                         f"Upstream {response.status_code}, retrying in {retry_after:.0f}s "

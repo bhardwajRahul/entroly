@@ -52,7 +52,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from entroly_core import ContextFragment
+try:
+    from entroly_core import ContextFragment
+except ImportError:
+    from dataclasses import dataclass as _dataclass
+
+    @_dataclass
+    class ContextFragment:  # type: ignore[no-redef]
+        """Pure-Python fallback when entroly_core (Rust) is not installed."""
+        fragment_id: str
+        content: str
+        token_count: int
+        source: str = ""
+        recency_score: float = 1.0
+        frequency_score: float = 0.0
+        semantic_score: float = 0.0
+        entropy_score: float = 0.5
+        turn_created: int = 0
+        turn_last_accessed: int = 0
+        access_count: int = 0
+        is_pinned: bool = False
+        simhash: int = 0
 
 # Checkpoint schema version — increment when serialization format changes.
 # Migration functions handle loading older versions.
@@ -364,8 +384,8 @@ class CheckpointManager:
             tmp_fd, tmp_path = tempfile.mkstemp(
                 dir=str(self.checkpoint_dir), suffix=".json.gz.tmp"
             )
+            os.close(tmp_fd)
             try:
-                os.close(tmp_fd)
                 with gzip.open(tmp_path, "wt", encoding="utf-8") as f:
                     f.write(data)
                     f.flush()

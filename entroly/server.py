@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 
 from .config import EntrolyConfig
 from .prefetch import PrefetchEngine
-from .checkpoint import CheckpointManager
+from .checkpoint import CheckpointManager, ContextFragment
 from .query_refiner import QueryRefiner
 from .adaptive_pruner import EntrolyPruner, FragmentGuard
 from .provenance import build_provenance, ContextProvenance
@@ -66,6 +66,250 @@ except ImportError:
     def py_refine_heuristic(query: str, context: str) -> str:  # type: ignore[misc]
         """Pure-Python stub — returns query unchanged."""
         return query
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Pure-Python fallback implementations (used when Rust engine unavailable)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _py_simhash(text: str) -> int:
+    """Compute a 64-bit SimHash fingerprint from text.
+
+    Uses trigrams (or unigrams for short text) hashed with MD5
+    to build a locality-sensitive fingerprint.
+    """
+    import hashlib as _hl
+    words = [w for w in text.lower().split() if w.isalnum() or any(c.isalnum() for c in w)]
+    if not words:
+        return 0
+
+    # Build features: trigrams if >= 3 words, else unigrams
+    features: list[str] = []
+    if len(words) >= 3:
+        for i in range(len(words) - 2):
+            features.append(f"{words[i]} {words[i+1]} {words[i+2]}")
+    else:
+        features = words
+
+    bit_sums = [0] * 64
+    for feat in features:
+        h = int(_hl.md5(feat.encode("utf-8", errors="replace")).hexdigest(), 16)
+        for i in range(64):
+            if (h >> i) & 1:
+                bit_sums[i] += 1
+            else:
+                bit_sums[i] -= 1
+
+    fingerprint = 0
+    for i in range(64):
+        if bit_sums[i] > 0:
+            fingerprint |= (1 << i)
+    return fingerprint
+
+
+def _py_hamming_distance(a: int, b: int) -> int:
+    """Count differing bits between two 64-bit fingerprints."""
+    return bin(a ^ b).count("1")
+
+
+class _PyDedupIndex:
+    """Pure-Python SimHash-based deduplication index (LSH banding)."""
+
+    def __init__(self, hamming_threshold: int = 3):
+        self._threshold = hamming_threshold
+        self._fingerprints: Dict[str, int] = {}
+        self._bands: List[Dict[int, List[str]]] = [{} for _ in range(4)]
+        self._duplicates_detected = 0
+
+    def insert(self, fragment_id: str, text: str) -> Optional[str]:
+        """Insert a fragment. Returns duplicate_id if near-duplicate found."""
+        fp = _py_simhash(text)
+
+        # Check bands for candidate matches
+        for band_idx in range(4):
+            band_hash = (fp >> (band_idx * 16)) & 0xFFFF
+            candidates = self._bands[band_idx].get(band_hash, [])
+            for cand_id in candidates:
+                cand_fp = self._fingerprints.get(cand_id)
+                if cand_fp is not None and _py_hamming_distance(fp, cand_fp) <= self._threshold:
+                    self._duplicates_detected += 1
+                    return cand_id
+
+        # No duplicate — register this fragment
+        self._fingerprints[fragment_id] = fp
+        for band_idx in range(4):
+            band_hash = (fp >> (band_idx * 16)) & 0xFFFF
+            self._bands[band_idx].setdefault(band_hash, []).append(fragment_id)
+        return None
+
+    def remove(self, fragment_id: str) -> None:
+        """Remove a fragment from the index."""
+        fp = self._fingerprints.pop(fragment_id, None)
+        if fp is None:
+            return
+        for band_idx in range(4):
+            band_hash = (fp >> (band_idx * 16)) & 0xFFFF
+            bucket = self._bands[band_idx].get(band_hash, [])
+            if fragment_id in bucket:
+                bucket.remove(fragment_id)
+
+    def stats(self) -> dict:
+        return {
+            "total_fingerprints": len(self._fingerprints),
+            "duplicates_detected": self._duplicates_detected,
+        }
+
+
+def _py_compute_information_score(
+    text: str,
+    global_token_counts: Dict[str, int],
+    total_tokens: int,
+    other_fragments: List[str],
+) -> float:
+    """Compute information density score [0, 1] using Shannon entropy + redundancy."""
+    import math as _m
+    if not text:
+        return 0.0
+
+    # 1. Normalized Shannon entropy on bytes (40% weight)
+    byte_counts: Dict[int, int] = {}
+    encoded = text.encode("utf-8", errors="replace")
+    for b in encoded:
+        byte_counts[b] = byte_counts.get(b, 0) + 1
+    total_bytes = len(encoded)
+    entropy = 0.0
+    for count in byte_counts.values():
+        p = count / total_bytes
+        if p > 0:
+            entropy -= p * _m.log2(p)
+    normalized_entropy = min(entropy / 6.0, 1.0)
+
+    # 2. Boilerplate penalty (30% weight)
+    lines = text.strip().splitlines()
+    boilerplate_lines = 0
+    for line in lines:
+        stripped = line.strip()
+        if (stripped.startswith(("import ", "from ")) or
+                stripped in ("pass", "...", "}", ")", "]", '"""') or
+                stripped.startswith("def __") or
+                stripped in ("return None", "return self", "return True", "return False")):
+            boilerplate_lines += 1
+    bp_ratio = boilerplate_lines / max(len(lines), 1)
+    bp_penalty = 1.0 - bp_ratio
+
+    # 3. Cross-fragment redundancy (30% weight)
+    uniqueness = 1.0
+    if other_fragments:
+        words = text.lower().split()
+        if len(words) >= 3:
+            text_trigrams = set()
+            for i in range(len(words) - 2):
+                text_trigrams.add(f"{words[i]} {words[i+1]} {words[i+2]}")
+            if text_trigrams:
+                other_trigrams: set = set()
+                for other in other_fragments:
+                    ow = other.lower().split()
+                    for i in range(len(ow) - 2):
+                        other_trigrams.add(f"{ow[i]} {ow[i+1]} {ow[i+2]}")
+                overlap = len(text_trigrams & other_trigrams)
+                redundancy = overlap / len(text_trigrams)
+                uniqueness = 1.0 - min(redundancy, 1.0)
+
+    score = 0.40 * normalized_entropy + 0.30 * bp_penalty + 0.30 * uniqueness
+    return max(0.0, min(1.0, score))
+
+
+def _py_compute_relevance(
+    frag: "ContextFragment",
+    w_recency: float,
+    w_frequency: float,
+    w_semantic: float,
+    w_entropy: float,
+    feedback_multiplier: float = 1.0,
+) -> float:
+    """Compute weighted relevance score with softcap [0, 1]."""
+    import math as _m
+    total_weight = w_recency + w_frequency + w_semantic + w_entropy
+    if total_weight == 0:
+        return 0.0
+    base = (
+        w_recency * frag.recency_score
+        + w_frequency * frag.frequency_score
+        + w_semantic * frag.semantic_score
+        + w_entropy * frag.entropy_score
+    ) / total_weight
+    raw = base * feedback_multiplier
+    # Gemini-style logit softcap at 0.85
+    cap = 0.85
+    return cap * _m.tanh(raw / cap)
+
+
+def _py_knapsack_optimize(
+    fragments: list,
+    token_budget: int,
+    w_recency: float,
+    w_frequency: float,
+    w_semantic: float,
+    w_entropy: float,
+) -> tuple:
+    """Pure-Python greedy knapsack optimizer.
+
+    Returns (selected_fragments, stats_dict).
+    """
+    # Separate pinned fragments (always included)
+    pinned = [f for f in fragments if f.is_pinned]
+    candidates = [f for f in fragments if not f.is_pinned]
+
+    pinned_tokens = sum(f.token_count for f in pinned)
+    remaining_budget = max(0, token_budget - pinned_tokens)
+
+    # Score and sort candidates by relevance/token ratio (greedy)
+    scored = []
+    for frag in candidates:
+        rel = _py_compute_relevance(frag, w_recency, w_frequency, w_semantic, w_entropy)
+        if frag.token_count > 0:
+            efficiency = rel / frag.token_count
+        else:
+            efficiency = rel
+        scored.append((frag, rel, efficiency))
+    scored.sort(key=lambda x: x[2], reverse=True)
+
+    selected = list(pinned)
+    used_tokens = pinned_tokens
+    total_relevance = sum(
+        _py_compute_relevance(f, w_recency, w_frequency, w_semantic, w_entropy) for f in pinned
+    )
+
+    for frag, rel, _ in scored:
+        if used_tokens + frag.token_count <= token_budget:
+            selected.append(frag)
+            used_tokens += frag.token_count
+            total_relevance += rel
+
+    stats = {
+        "total_tokens": used_tokens,
+        "total_relevance": round(total_relevance, 4),
+        "method": "greedy_python",
+        "pinned_count": len(pinned),
+        "candidate_count": len(candidates),
+    }
+    return selected, stats
+
+
+def _py_apply_ebbinghaus_decay(
+    fragments: list,
+    current_turn: int,
+    half_life: int,
+) -> None:
+    """Apply Ebbinghaus forgetting curve to fragment recency scores (in-place)."""
+    import math as _m
+    if half_life <= 0:
+        return
+    decay_rate = _m.log(2) / half_life
+    for frag in fragments:
+        dt = max(0, current_turn - frag.turn_last_accessed)
+        frag.recency_score = _m.exp(-decay_rate * dt)
 
 # Configure logging to stderr (MCP requires stdout for JSON-RPC)
 logging.basicConfig(
@@ -157,7 +401,7 @@ class EntrolyEngine:
             from collections import Counter
             self._global_token_counts: Counter = Counter()
             self._total_token_count: int = 0
-            self._dedup = DedupIndex(hamming_threshold=3)
+            self._dedup = _PyDedupIndex(hamming_threshold=3)
             self._total_tokens_saved: int = 0
             self._total_optimizations: int = 0
             self._total_fragments_ingested: int = 0
@@ -223,7 +467,7 @@ class EntrolyEngine:
         else:
             self._current_turn += 1
             fragments = list(self._fragments.values())
-            apply_ebbinghaus_decay(
+            _py_apply_ebbinghaus_decay(
                 fragments,
                 self._current_turn,
                 self.config.decay_half_life_turns,
@@ -431,7 +675,7 @@ class EntrolyEngine:
             self._fragments.clear()
             for frag in self._checkpoint_mgr.restore_fragments(ckpt):
                 self._fragments[frag.fragment_id] = frag
-            self._dedup = DedupIndex(hamming_threshold=3)
+            self._dedup = _PyDedupIndex(hamming_threshold=3)
             for fid, fp in ckpt.dedup_fingerprints.items():
                 self._dedup._fingerprints[fid] = fp
             self._current_turn = ckpt.current_turn
@@ -572,7 +816,7 @@ class EntrolyEngine:
         all_frags = list(self._fragments.values())
         sample = _rng.sample(all_frags, min(50, len(all_frags))) if len(all_frags) > 50 else all_frags
         other_contents = [f.content for f in sample]
-        entropy_score = compute_information_score(
+        entropy_score = _py_compute_information_score(
             content,
             global_token_counts=dict(self._global_token_counts),
             total_tokens=self._total_token_count,
@@ -596,7 +840,7 @@ class EntrolyEngine:
             turn_last_accessed=self._current_turn,
             access_count=1,
             is_pinned=is_pinned,
-            simhash=simhash(content),
+            simhash=_py_simhash(content),
         )
 
         self._fragments[frag_id] = frag
@@ -641,10 +885,9 @@ class EntrolyEngine:
         self._total_optimizations += 1
 
         if query:
-            query_hash = simhash(query)
-            from .dedup import hamming_distance
+            query_hash = _py_simhash(query)
             for frag in self._fragments.values():
-                dist = hamming_distance(query_hash, frag.simhash)
+                dist = _py_hamming_distance(query_hash, frag.simhash)
                 frag.semantic_score = max(0.0, 1.0 - (dist / 64.0))
 
         # Apply Wilson feedback via the frequency dimension. Wilson learned_value
@@ -656,7 +899,7 @@ class EntrolyEngine:
             frag.frequency_score = max(0.0, min((wilson - 0.5) / 1.5, 1.0))
 
         fragments = list(self._fragments.values())
-        selected, stats = knapsack_optimize(
+        selected, stats = _py_knapsack_optimize(
             fragments,
             token_budget,
             w_recency=self.config.weight_recency,
@@ -680,7 +923,7 @@ class EntrolyEngine:
                     "source": f.source,
                     "token_count": f.token_count,
                     "relevance": round(
-                        compute_relevance(
+                        _py_compute_relevance(
                             f,
                             self.config.weight_recency,
                             self.config.weight_frequency,
@@ -702,14 +945,13 @@ class EntrolyEngine:
         if not self._fragments:
             return []
 
-        query_hash = simhash(query)
-        from .dedup import hamming_distance
+        query_hash = _py_simhash(query)
 
         scored = []
         for frag in self._fragments.values():
-            dist = hamming_distance(query_hash, frag.simhash)
+            dist = _py_hamming_distance(query_hash, frag.simhash)
             frag.semantic_score = max(0.0, 1.0 - (dist / 64.0))
-            relevance = compute_relevance(
+            relevance = _py_compute_relevance(
                 frag,
                 self.config.weight_recency,
                 self.config.weight_frequency,

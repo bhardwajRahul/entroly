@@ -335,6 +335,9 @@ class ProxyConfig:
         except Exception:
             return  # non-critical
 
+        if not isinstance(tc, dict):
+            return  # Guard against non-object JSON (e.g. array or string)
+
         logger = logging.getLogger("entroly.proxy")
 
         # EGTC coefficients
