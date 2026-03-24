@@ -30,6 +30,8 @@ mod utilization;
 mod semantic_dedup;
 mod conversation_pruner;
 mod channel;
+mod nkbe;
+mod cognitive_bus;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -2326,6 +2328,9 @@ fn entroly_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_progressive_thresholds, m)?)?;
     m.add_function(wrap_pyfunction!(py_compress_block, m)?)?;
     m.add_function(wrap_pyfunction!(py_classify_block, m)?)?;
+    // ── Multi-Agent (additive — new classes, no existing API changes)
+    m.add_class::<nkbe::NkbeAllocator>()?;
+    m.add_class::<cognitive_bus::CognitiveBus>()?;
     Ok(())
 }
 
