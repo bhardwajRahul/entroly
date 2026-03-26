@@ -32,6 +32,7 @@ mod conversation_pruner;
 mod channel;
 mod nkbe;
 mod cognitive_bus;
+mod cache;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -148,6 +149,9 @@ pub struct EntrolyEngine {
     /// EMA baseline for REINFORCE advantage A = R − μ (variance reduction).
     /// Updated on every record_success / record_failure call.
     reward_baseline_ema: f64,
+
+    // EGSC — Entropy-Gated Submodular Cache (novel: no prior art)
+    egsc_cache: cache::EgscCache,
 }
 
 /// Snapshot of the last optimization for explainability.
@@ -256,6 +260,7 @@ impl EntrolyEngine {
             enable_query_personas: true,
             enable_channel_coding: true,
             reward_baseline_ema: 0.0,
+            egsc_cache: cache::EgscCache::default(),
         }
     }
 
