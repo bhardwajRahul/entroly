@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/logo.png" width="200" alt="Entroly Logo">
+  <img src="https://raw.githubusercontent.com/juyterman1000/entroly/main/docs/assets/logo.png" width="200" alt="Entroly Logo">
 </p>
 
 <h1 align="center">Entroly</h1>
@@ -38,7 +38,7 @@
 ## See It In Action
 
 <p align="center">
-  <img src="docs/assets/demo.svg" alt="Entroly Demo — 78% token savings in 8ms" width="800">
+  <img src="https://raw.githubusercontent.com/juyterman1000/entroly/main/docs/assets/demo.svg" alt="Entroly Demo — 78% token savings in 8ms" width="800">
 </p>
 
 > **Run it yourself:** `pip install entroly && entroly demo`
