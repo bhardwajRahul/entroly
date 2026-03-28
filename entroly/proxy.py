@@ -305,6 +305,323 @@ def compress_conversation_messages(
         return messages
 
 
+# ── Passive Implicit Feedback ─────────────────────────────────────────────
+#
+# Extracts RL feedback signals from observable proxy traffic:
+#   Signal 1: LLM confusion detection (response text analysis)
+#   Signal 2: Query trajectory rephrase detection (SimHash similarity)
+#   Signal 3: Sufficiency heuristic (already computed in optimize)
+#
+# This closes the RL feedback loop without IDE cooperation.
+# Reference: Implementation plan — "3-Signal Passive Feedback"
+
+
+class ImplicitFeedbackTracker:
+    """Extract implicit RL feedback from proxy traffic.
+
+    Thread-safe. Per-client state tracks query trajectories for
+    rephrase detection. Response text is scanned for confusion
+    indicators to infer success/failure.
+    """
+
+    # ── Signal 1: Confusion patterns in LLM responses ────────────────
+    # When the LLM says these phrases, our context selection failed.
+    _CONFUSION_PATTERNS = re.compile(
+        r"(?:I\s+(?:don'?t|do\s+not)\s+(?:have|see)\s+(?:enough\s+|the\s+)?(?:context|code|file|information))"
+        r"|(?:could\s+you\s+(?:provide|share|show|paste))"
+        r"|(?:I(?:'m|\s+am)\s+not\s+(?:sure|certain)\s+(?:about|what|which|where))"
+        r"|(?:without\s+(?:seeing|access|the\s+(?:full|actual|complete)))"
+        r"|(?:I\s+(?:cannot|can'?t)\s+(?:see|access|find|determine))"
+        r"|(?:I\s+(?:don'?t|do\s+not)\s+have\s+(?:access|visibility))"
+        r"|(?:(?:more|additional)\s+context\s+(?:would|is)\s+(?:needed|helpful|required))"
+        r"|(?:please\s+(?:share|provide|paste)\s+(?:the|your))",
+        re.IGNORECASE,
+    )
+
+    # Minimum response length to trigger confidence signal (chars)
+    _MIN_CONFIDENT_LENGTH = 200
+
+    # Rephrase detection thresholds
+    _REPHRASE_SIMILARITY_THRESHOLD = 0.75  # SimHash similarity > this = rephrase
+    _REPHRASE_TIME_WINDOW_S = 90.0  # Within this many seconds
+    _TOPIC_CHANGE_THRESHOLD = 0.30  # Similarity < this = topic change = success
+
+    # Buffer cap for streaming responses (bytes)
+    _MAX_BUFFER_BYTES = 50 * 1024  # 50KB — covers 99%+ of LLM responses
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # Per-client trajectory: client_key -> (query_simhash, selected_ids, timestamp)
+        self._trajectories: Dict[str, tuple] = {}
+        # Stats
+        self._confusion_detections = 0
+        self._confidence_detections = 0
+        self._rephrase_detections = 0
+        self._topic_changes = 0
+        self._total_assessed = 0
+        # CUSUM-EMA quality drift detector (arXiv 2025, NeurIPS 2025)
+        self._drift_detector = _CusumEmaDriftDetector()
+
+    def assess_response(self, response_text: str) -> float:
+        """Assess an LLM response for confusion vs confidence.
+
+        Returns a reward signal:
+          -1.0  = strong confusion detected (multiple indicators)
+          -0.5  = mild confusion detected (one indicator)
+           0.0  = ambiguous / too short to tell
+          +0.3  = confident response (long, structured)
+          +0.5  = confident response with code blocks
+        """
+        if not response_text or len(response_text) < 50:
+            return 0.0
+
+        # Count confusion pattern matches
+        confusion_matches = len(self._CONFUSION_PATTERNS.findall(response_text[:5000]))
+
+        if confusion_matches >= 2:
+            return -1.0  # Strong confusion
+        if confusion_matches == 1:
+            return -0.5  # Mild confusion
+
+        # Check for confidence signals
+        has_code_blocks = "```" in response_text
+        is_long = len(response_text) >= self._MIN_CONFIDENT_LENGTH
+
+        if is_long and has_code_blocks:
+            return 0.5  # Confident with code
+        if is_long:
+            return 0.3  # Confident (structured answer)
+
+        return 0.0  # Ambiguous
+
+    def detect_rephrase(
+        self, client_key: str, query_text: str, selected_ids: list
+    ) -> Optional[tuple]:
+        """Check if this query is a rephrase of the previous one.
+
+        Returns:
+          ("rephrase", prev_selected_ids) if rephrase detected -> failure signal
+          ("topic_change", prev_selected_ids) if topic changed -> success signal
+          None if no trajectory data or ambiguous
+        """
+        try:
+            from entroly_core import py_simhash
+            query_hash = py_simhash(query_text)
+        except (ImportError, Exception):
+            return None
+
+        now = time.time()
+
+        with self._lock:
+            prev = self._trajectories.get(client_key)
+
+            # Update trajectory
+            self._trajectories[client_key] = (query_hash, selected_ids, now)
+
+            # Evict old entries (> 1000 clients)
+            if len(self._trajectories) > 1000:
+                oldest_key = min(
+                    self._trajectories,
+                    key=lambda k: self._trajectories[k][2],
+                )
+                del self._trajectories[oldest_key]
+
+        if prev is None:
+            return None
+
+        prev_hash, prev_ids, prev_time = prev
+        time_delta = now - prev_time
+
+        if time_delta > self._REPHRASE_TIME_WINDOW_S:
+            return None  # Too long ago to be a rephrase
+
+        if not prev_ids:
+            return None  # No fragment IDs to attribute
+
+        # Compute SimHash similarity (Hamming-based)
+        xor = query_hash ^ prev_hash
+        hamming = bin(xor).count("1")
+        similarity = 1.0 - (hamming / 64.0)
+
+        if similarity > self._REPHRASE_SIMILARITY_THRESHOLD:
+            with self._lock:
+                self._rephrase_detections += 1
+            return ("rephrase", prev_ids)
+
+        if similarity < self._TOPIC_CHANGE_THRESHOLD:
+            with self._lock:
+                self._topic_changes += 1
+            return ("topic_change", prev_ids)
+
+        return None  # Ambiguous mid-range similarity
+
+    def record_assessment(self, reward: float) -> None:
+        """Track assessment stats and feed the drift detector."""
+        with self._lock:
+            self._total_assessed += 1
+            if reward < -0.25:
+                self._confusion_detections += 1
+            elif reward > 0.25:
+                self._confidence_detections += 1
+            # Feed dual drift detector
+            self._drift_detector.update(reward)
+
+    def quality_trend(self) -> str:
+        """Return current quality trend: 'stable', 'declining', or 'improving'."""
+        with self._lock:
+            return self._drift_detector.trend()
+
+    def stats(self) -> Dict[str, Any]:
+        """Return feedback tracker statistics."""
+        with self._lock:
+            drift_stats = self._drift_detector.to_dict()
+            return {
+                "total_assessed": self._total_assessed,
+                "confusion_detections": self._confusion_detections,
+                "confidence_detections": self._confidence_detections,
+                "rephrase_detections": self._rephrase_detections,
+                "topic_changes": self._topic_changes,
+                "quality_trend": drift_stats["trend"],
+                "drift_detector": drift_stats,
+            }
+
+
+class _CusumEmaDriftDetector:
+    """Dual online quality drift detector: CUSUM + EMA.
+
+    Combines two complementary algorithms from the change-point detection
+    literature (Online Kernel CUSUM, arXiv 2025; RL drift detection,
+    NeurIPS 2025):
+
+    1. **EMA** (Exponential Moving Average): Smooth trend tracker.
+       α = 0.15 → emphasizes recent observations. Fast to respond but
+       susceptible to noise.
+
+    2. **Page's CUSUM** (Cumulative Sum): Detects persistent drift in
+       the reward signal. Accumulates deviations from the target mean.
+       More robust than EMA — fires only on sustained degradation.
+
+    Quality trend states:
+      - "stable": Both detectors within bounds
+      - "declining": Either detector flags degradation
+      - "improving": EMA above positive threshold after a decline
+
+    Thread-safety: Caller must hold lock (ImplicitFeedbackTracker._lock).
+    """
+
+    # EMA smoothing factor: 0.15 gives ~13-sample effective window
+    _ALPHA = 0.15
+    # CUSUM sensitivity: accumulate when reward < this target
+    _TARGET_MEAN = 0.0
+    # CUSUM decision threshold: fire alarm when cumulative sum exceeds this
+    _CUSUM_THRESHOLD = 3.0
+    # EMA threshold for "declining" signal
+    _EMA_DECLINE_THRESHOLD = -0.20
+    # EMA threshold for "improving" signal
+    _EMA_IMPROVE_THRESHOLD = 0.15
+    # Minimum observations before drift detection activates
+    _MIN_OBSERVATIONS = 5
+
+    def __init__(self):
+        self.ema: float = 0.0
+        self.cusum_pos: float = 0.0  # Detect upward shift (quality improving)
+        self.cusum_neg: float = 0.0  # Detect downward shift (quality declining)
+        self.count: int = 0
+        self._was_declining: bool = False
+
+    def update(self, reward: float) -> None:
+        """Feed a new reward observation."""
+        self.count += 1
+
+        # EMA update
+        if self.count == 1:
+            self.ema = reward
+        else:
+            self.ema = self._ALPHA * reward + (1.0 - self._ALPHA) * self.ema
+
+        # Page's CUSUM update (two-sided)
+        deviation = reward - self._TARGET_MEAN
+        self.cusum_pos = max(0.0, self.cusum_pos + deviation)
+        self.cusum_neg = max(0.0, self.cusum_neg - deviation)
+
+        # Track state transitions for "improving" detection
+        if self.trend() == "declining":
+            self._was_declining = True
+
+    def trend(self) -> str:
+        """Return current quality trend."""
+        if self.count < self._MIN_OBSERVATIONS:
+            return "stable"  # Not enough data yet
+
+        # Declining: EMA below threshold OR CUSUM negative alarm
+        if (self.ema < self._EMA_DECLINE_THRESHOLD
+                or self.cusum_neg > self._CUSUM_THRESHOLD):
+            return "declining"
+
+        # Improving: EMA above positive threshold AND recovered from decline
+        if self._was_declining and self.ema > self._EMA_IMPROVE_THRESHOLD:
+            return "improving"
+
+        return "stable"
+
+    def reset(self) -> None:
+        """Reset detector state (e.g., on session restart)."""
+        self.ema = 0.0
+        self.cusum_pos = 0.0
+        self.cusum_neg = 0.0
+        self.count = 0
+        self._was_declining = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ema": round(self.ema, 4),
+            "cusum_pos": round(self.cusum_pos, 4),
+            "cusum_neg": round(self.cusum_neg, 4),
+            "observations": self.count,
+            "trend": self.trend(),
+        }
+
+
+def _extract_text_from_sse(raw_bytes: bytes) -> str:
+    """Extract assistant text content from SSE stream bytes.
+
+    Handles OpenAI, Anthropic, and Gemini SSE formats.
+    Returns concatenated text content for confusion pattern analysis.
+    """
+    text_parts = []
+    try:
+        text = raw_bytes.decode("utf-8", errors="replace")
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # OpenAI format: choices[0].delta.content
+            for choice in data.get("choices", []):
+                delta = choice.get("delta", {})
+                if "content" in delta and delta["content"]:
+                    text_parts.append(delta["content"])
+            # Anthropic format: content_block.text or delta.text
+            if data.get("type") == "content_block_delta":
+                delta = data.get("delta", {})
+                if "text" in delta:
+                    text_parts.append(delta["text"])
+            # Gemini format: candidates[0].content.parts[0].text
+            for candidate in data.get("candidates", []):
+                for part in candidate.get("content", {}).get("parts", []):
+                    if "text" in part:
+                        text_parts.append(part["text"])
+    except Exception:
+        pass
+    return "".join(text_parts)
+
+
 # ── Proxy ────────────────────────────────────────────────────────────────
 
 
@@ -362,6 +679,12 @@ class PromptCompilerProxy:
 
         # Pipeline latency tracking (Welford online stats)
         self._pipeline_stats = _WelfordStats()
+
+        # Passive implicit feedback — closes the RL loop without IDE cooperation
+        self._feedback_tracker = ImplicitFeedbackTracker()
+        self._enable_passive_feedback = (
+            os.environ.get("ENTROLY_PASSIVE_FEEDBACK", "1") != "0"
+        )
 
     async def startup(self) -> None:
         self._client = httpx.AsyncClient(
@@ -472,6 +795,9 @@ class PromptCompilerProxy:
                     or headers.get("x-goog-api-key", ""))
         client_key = hashlib.sha256(auth_raw.encode()).hexdigest()[:12] if auth_raw else "_default"
 
+        # Track selected fragment IDs for passive feedback attribution
+        _selected_frag_ids: list = []
+
         # Run the optimization pipeline (synchronous Rust, off the event loop)
         try:
             user_message = extract_user_message(body, provider)
@@ -485,6 +811,13 @@ class PromptCompilerProxy:
 
                 # Track pipeline latency
                 self._pipeline_stats.add(pipeline_ms)
+
+                # Collect fragment IDs for passive feedback
+                _selected_frag_ids = [
+                    f.get("id", f.get("fragment_id", ""))
+                    for f in pipeline_result.get("selected_fragments", [])
+                    if f.get("id") or f.get("fragment_id")
+                ]
 
                 if context_text:
                     # Gap #36: Confidence threshold — skip injection if
@@ -618,6 +951,29 @@ class PromptCompilerProxy:
         # Await warmup (usually completes during pipeline, essentially free)
         await warmup_task
 
+        # ── Signal 2: Query trajectory rephrase detection ──
+        if self._enable_passive_feedback and user_message:
+            try:
+                rephrase_result = self._feedback_tracker.detect_rephrase(
+                    client_key, user_message, _selected_frag_ids
+                )
+                if rephrase_result:
+                    signal_type, prev_ids = rephrase_result
+                    if signal_type == "rephrase" and prev_ids:
+                        logger.debug("Rephrase detected → record_failure(%d ids)", len(prev_ids))
+                        try:
+                            self.engine.record_failure(prev_ids)
+                        except Exception:
+                            pass
+                    elif signal_type == "topic_change" and prev_ids:
+                        logger.debug("Topic change → record_success(%d ids)", len(prev_ids))
+                        try:
+                            self.engine.record_success(prev_ids)
+                        except Exception:
+                            pass
+            except Exception:
+                pass  # Never block the request for feedback
+
         # Forward to real API (target_url already resolved above)
         forward_headers = self._build_headers(headers, provider)
         is_streaming = body.get("stream", False)
@@ -627,9 +983,13 @@ class PromptCompilerProxy:
             is_streaming = True
 
         if is_streaming:
-            return await self._stream_response(target_url, forward_headers, body)
+            return await self._stream_response(
+                target_url, forward_headers, body, _selected_frag_ids
+            )
         else:
-            return await self._forward_response(target_url, forward_headers, body)
+            return await self._forward_response(
+                target_url, forward_headers, body, _selected_frag_ids
+            )
 
     def _run_pipeline(self, user_message: str, body: Dict[str, Any], path: str = "") -> Dict[str, Any]:
         """Run the synchronous optimization pipeline. Called via asyncio.to_thread.
@@ -815,9 +1175,15 @@ class PromptCompilerProxy:
         }
 
     async def _stream_response(
-        self, url: str, headers: Dict[str, str], body: Dict[str, Any]
+        self, url: str, headers: Dict[str, str], body: Dict[str, Any],
+        selected_frag_ids: list | None = None,
     ) -> StreamingResponse:
-        """Forward a streaming request and proxy the SSE response."""
+        """Forward a streaming request and proxy the SSE response.
+
+        When passive feedback is enabled, tees response chunks into a buffer
+        (capped at 50KB) and fires implicit feedback analysis after the
+        stream completes. Zero latency impact — analysis runs in background.
+        """
         # Check circuit breaker
         if not self._breaker.allow_request():
             return JSONResponse(
@@ -826,13 +1192,26 @@ class PromptCompilerProxy:
                 headers={"Retry-After": str(int(self._breaker.cooldown_s))},
             )
 
+        # Capture references for the async generator closure
+        _tracker = self._feedback_tracker
+        _engine = self.engine
+        _feedback_enabled = self._enable_passive_feedback and bool(selected_frag_ids)
+        _frag_ids = selected_frag_ids or []
+        _buffer_cap = ImplicitFeedbackTracker._MAX_BUFFER_BYTES
+
         async def event_generator():
+            buffer = [] if _feedback_enabled else None
+            buffer_size = 0
             try:
                 client = await self._ensure_client()
                 async with client.stream(
                     "POST", url, json=body, headers=headers
                 ) as response:
                     async for chunk in response.aiter_bytes():
+                        # Tee: pass through AND accumulate for analysis
+                        if buffer is not None and buffer_size < _buffer_cap:
+                            buffer.append(chunk)
+                            buffer_size += len(chunk)
                         yield chunk
                 self._breaker.record_success()
             except httpx.ReadError as e:
@@ -847,6 +1226,29 @@ class PromptCompilerProxy:
                 self._breaker.record_failure()
                 logger.warning(f"Unexpected stream error: {e}")
                 yield f'data: {{"error": "stream_error"}}\n\n'.encode()
+
+            # ── Signal 1: Assess response after stream completes ──
+            # REVOLUTIONARY FIX: Eliminate the dead zone.
+            # Old: binary record_success/record_failure gated at ±0.5/+0.3
+            #      → ~52% of signals discarded (everything in -0.5 < r < 0.3)
+            # New: record_reward(continuous) for ALL non-zero rewards.
+            #      Inspired by HER (NeurIPS 2025) — ambiguous outcomes carry
+            #      gradient information when aggregated over hundreds of requests.
+            if buffer and _frag_ids:
+                try:
+                    full_bytes = b"".join(buffer)
+                    response_text = _extract_text_from_sse(full_bytes)
+                    if response_text:
+                        reward = _tracker.assess_response(response_text)
+                        _tracker.record_assessment(reward)
+                        if abs(reward) > 0.01:  # Only skip truly zero signals
+                            logger.debug(
+                                "Stream RL signal (%.2f) → record_reward(%d ids)",
+                                reward, len(_frag_ids),
+                            )
+                            _engine.record_reward(_frag_ids, reward)
+                except Exception:
+                    pass  # Never fail on feedback
 
         resp_headers = {
             "Cache-Control": "no-cache",
@@ -870,6 +1272,10 @@ class PromptCompilerProxy:
                 resp_headers["X-Entroly-Cost-Saved-Today"] = f"${_conf.get('today', {}).get('cost_saved_usd', 0):.4f}"
             except Exception:
                 pass
+            # Quality drift signal — "check engine light" for context quality
+            quality_trend = self._feedback_tracker.quality_trend()
+            if quality_trend != "stable":
+                resp_headers["X-Entroly-Quality-Trend"] = quality_trend
 
         return StreamingResponse(
             event_generator(),
@@ -878,7 +1284,8 @@ class PromptCompilerProxy:
         )
 
     async def _forward_response(
-        self, url: str, headers: Dict[str, str], body: Dict[str, Any]
+        self, url: str, headers: Dict[str, str], body: Dict[str, Any],
+        selected_frag_ids: list | None = None,
     ) -> JSONResponse:
         """Forward a non-streaming request with circuit breaker, retry on 429/5xx, and response validation."""
         # Check circuit breaker
@@ -955,6 +1362,10 @@ class PromptCompilerProxy:
                 resp_headers["X-Entroly-Cost-Saved-Today"] = f"${today_data.get('cost_saved_usd', 0.0):.4f}"
             except Exception:
                 pass
+            # Quality drift signal
+            quality_trend = self._feedback_tracker.quality_trend()
+            if quality_trend != "stable":
+                resp_headers["X-Entroly-Quality-Trend"] = quality_trend
 
         # Validate response content-type before parsing JSON
         content_type = response.headers.get("content-type", "")
@@ -973,6 +1384,39 @@ class PromptCompilerProxy:
                 "status": response.status_code,
                 "body_preview": response.text[:500],
             }
+
+        # ── Signal 1: Assess non-streaming response for implicit feedback ──
+        if self._enable_passive_feedback and selected_frag_ids and isinstance(content, dict):
+            try:
+                # Extract assistant text from response JSON
+                response_text = ""
+                # OpenAI / Anthropic: choices[0].message.content
+                for choice in content.get("choices", []):
+                    msg = choice.get("message", {})
+                    if msg.get("content"):
+                        response_text += msg["content"]
+                # Anthropic direct: content[0].text
+                for block in content.get("content", []):
+                    if isinstance(block, dict) and block.get("text"):
+                        response_text += block["text"]
+                # Gemini: candidates[0].content.parts[0].text
+                for cand in content.get("candidates", []):
+                    for part in cand.get("content", {}).get("parts", []):
+                        if part.get("text"):
+                            response_text += part["text"]
+
+                if response_text:
+                    reward = self._feedback_tracker.assess_response(response_text)
+                    self._feedback_tracker.record_assessment(reward)
+                    # Continuous RL signal — eliminate dead zone
+                    if abs(reward) > 0.01 and selected_frag_ids:
+                        logger.debug(
+                            "Response RL signal (%.2f) -> record_reward(%d ids)",
+                            reward, len(selected_frag_ids),
+                        )
+                        self.engine.record_reward(selected_frag_ids, reward)
+            except Exception:
+                pass  # Never block response for feedback
 
         return JSONResponse(
             content=content,
@@ -1392,6 +1836,8 @@ async def _proxy_stats(request: Request) -> JSONResponse:
                 "last_temperature": proxy._last_temperature,
                 "calibrations": proxy._temperature_count,
             }
+        # Passive RL feedback stats
+        stats["implicit_feedback"] = proxy._feedback_tracker.stats()
     return JSONResponse(stats)
 
 

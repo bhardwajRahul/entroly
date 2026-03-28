@@ -844,38 +844,6 @@ impl EntrolyEngine {
                         }
                     }
                 }
-                if frags.len() > final_indices.len() && !final_indices.is_empty() && should_explore {
-                    let selected_set: HashSet<usize> = final_indices.iter().copied().collect();
-                    let unselected: Vec<usize> = (0..frags.len())
-                        .filter(|i| !selected_set.contains(i) && !frags[*i].is_pinned)
-                        .collect();
-                    if !unselected.is_empty() {
-                        let mut min_rel = f64::MAX;
-                        let mut min_pos = None;
-                        for (pos, &idx) in final_indices.iter().enumerate() {
-                            if !frags[idx].is_pinned {
-                                let fm = feedback_mults.get(&frags[idx].fragment_id).copied().unwrap_or(1.0);
-                                let rel = compute_relevance(&frags[idx], self.w_recency, self.w_frequency, self.w_semantic, self.w_entropy, fm);
-                                if rel < min_rel { min_rel = rel; min_pos = Some(pos); }
-                            }
-                        }
-                        if let Some(pos) = min_pos {
-                            let explore_idx = *unselected.iter()
-                                .max_by(|&&a, &&b| {
-                                    self.feedback.ucb_score(&frags[a].fragment_id, alpha_0)
-                                        .partial_cmp(&self.feedback.ucb_score(&frags[b].fragment_id, alpha_0))
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                }).unwrap();
-                            let old_tokens = frags[final_indices[pos]].token_count;
-                            let new_tokens = frags[explore_idx].token_count;
-                            if new_tokens <= old_tokens + 100 {
-                                explored_ids.push(frags[explore_idx].fragment_id.clone());
-                                final_indices[pos] = explore_idx;
-                                self.total_explorations += 1;
-                            }
-                        }
-                    }
-                }
 
                 // Skeleton Substitution pass
                 let full_tokens_legacy: u32 = final_indices.iter().map(|&i| frags[i].token_count).sum();
@@ -957,6 +925,37 @@ impl EntrolyEngine {
                 .collect();
             let sufficiency = self.compute_sufficiency(&frags, &final_indices);
 
+            // ── Spectral Contradiction Guard ──
+            // Detect and evict fragments that are structurally similar but
+            // semantically contradictory (e.g., two versions of the same class).
+            // Based on SimHash Divergence Ratio (SDR) — NeurIPS 2025/FORGE '26.
+            let contradictions_evicted;
+            let final_indices = if self.enable_channel_coding {
+                let pre_relevances: Vec<f64> = final_indices.iter()
+                    .map(|&i| {
+                        let fm = feedback_mults.get(&frags[i].fragment_id).copied().unwrap_or(1.0);
+                        compute_relevance(&frags[i], self.w_recency, self.w_frequency, self.w_semantic, self.w_entropy, fm)
+                    })
+                    .collect();
+                let (filtered, report) = channel::contradiction_guard(
+                    &frags, &final_indices, &pre_relevances,
+                    0.25,  // sdr_threshold
+                    0.60,  // structural_threshold
+                );
+                contradictions_evicted = report.pairs_found;
+                if report.pairs_found > 0 {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[entroly] Contradiction guard: evicted {} fragments ({} pairs)",
+                        report.evicted.len(), report.pairs_found,
+                    );
+                }
+                filtered
+            } else {
+                contradictions_evicted = 0;
+                final_indices
+            };
+
             // ── Context ordering: sort selected for LLM attention ──
             let ordered_indices = if self.enable_channel_coding {
                 // Channel Coding: attention-aware semantic interleaving
@@ -967,7 +966,16 @@ impl EntrolyEngine {
                         compute_relevance(&frags[i], self.w_recency, self.w_frequency, self.w_semantic, self.w_entropy, fm)
                     })
                     .collect();
-                channel::semantic_interleave(&frags, &final_indices, &relevances, &self.dep_graph)
+                let interleaved = channel::semantic_interleave(&frags, &final_indices, &relevances, &self.dep_graph);
+
+                // Bookend Attention Calibration: within each causal level,
+                // place highest-importance fragments at U-shaped attention peaks.
+                // "Found in the Middle" (Google Research 2025), ACL Findings 2025.
+                let rel_map: std::collections::HashMap<usize, f64> = final_indices.iter()
+                    .zip(relevances.iter())
+                    .map(|(&idx, &rel)| (idx, rel))
+                    .collect();
+                channel::bookend_calibrate(&interleaved, &frags, &rel_map, &self.dep_graph)
             } else {
                 let mut ordered = final_indices.clone();
                 ordered.sort_by(|&a, &b| {
@@ -1086,6 +1094,9 @@ impl EntrolyEngine {
             }
             if !explored_ids.is_empty() {
                 py_result.set_item("explored", explored_ids.clone())?;
+            }
+            if contradictions_evicted > 0 {
+                py_result.set_item("contradictions_evicted", contradictions_evicted)?;
             }
             if let Some(div_score) = ios_diversity_score {
                 py_result.set_item("ios_diversity_score", div_score)?;
@@ -1352,6 +1363,20 @@ impl EntrolyEngine {
                 },
             )?;
             result.set_item("policy", policy)?;
+
+            // ── PRISM RL Observability ──
+            // Expose learned weights so the RL loop is observable.
+            // Without this, there's no way to verify weights are actually changing.
+            let prism = PyDict::new(py);
+            prism.set_item("w_recency", (self.w_recency * 10000.0).round() / 10000.0)?;
+            prism.set_item("w_frequency", (self.w_frequency * 10000.0).round() / 10000.0)?;
+            prism.set_item("w_semantic", (self.w_semantic * 10000.0).round() / 10000.0)?;
+            prism.set_item("w_entropy", (self.w_entropy * 10000.0).round() / 10000.0)?;
+            prism.set_item("gradient_temperature", (self.gradient_temperature * 10000.0).round() / 10000.0)?;
+            prism.set_item("reward_baseline_ema", (self.reward_baseline_ema * 10000.0).round() / 10000.0)?;
+            prism.set_item("gradient_norm_ema", (self.gradient_norm_ema * 10000.0).round() / 10000.0)?;
+            prism.set_item("condition_number", (self.prism_optimizer.condition_number() * 100.0).round() / 100.0)?;
+            result.set_item("prism", prism)?;
 
             // EGSC Cache stats — exposed to Python for monitoring and debugging
             let cs = self.egsc_cache.stats();
@@ -2250,6 +2275,38 @@ impl EntrolyEngine {
         let tau = self.gradient_temperature.max(0.01);
         let selected: HashSet<&str> = fragment_ids.iter().map(|s| s.as_str()).collect();
 
+        // ── Per-Fragment Counterfactual Credit (Shapley-inspired) ──
+        //
+        // The uniform advantage A = (action_i - p_i) × R gives every selected
+        // fragment the SAME credit. This creates "reward pollution": irrelevant
+        // fragments accumulate false positive weight.
+        //
+        // Solution: Weight each fragment's advantage by its *marginal information
+        // contribution* — a Shapley-inspired decomposition (ICML 2025 ViaSHAP;
+        // NeurIPS 2025 FastSVERL).
+        //
+        // φᵢ = entropy_i / Σⱼ∈S(entropy_j)  (information share)
+        //
+        // High-entropy fragments bear more responsibility for outcomes because
+        // they contributed more information to the LLM's reasoning.
+        let selected_entropy_sum: f64 = fragment_ids.iter()
+            .filter_map(|id| self.fragments.get(id))
+            .map(|f| f.entropy_score.max(0.01))
+            .sum();
+        let selected_entropy_sum = selected_entropy_sum.max(0.01); // Prevent div by zero
+
+        // ── Eligibility Traces: TD(λ) Temporal Credit ──
+        //
+        // Current request's outcome may depend on context assembled in past
+        // requests. Eligibility traces propagate attenuated credit backward:
+        //   e_i(t) = λ_trace × e_i(t-1) + ∂log π(a_i|s) / ∂θ
+        //
+        // Fragments selected in this AND recent requests receive credit
+        // proportional to their trace magnitude.
+        //
+        // λ_trace = 0.7 gives ~3-request effective memory window.
+        let trace_lambda = 0.7_f64;
+
         // Compute REINFORCE-with-baseline policy gradient
         let mut g = [0.0_f64; 4]; // [∂/∂w_r, ∂/∂w_f, ∂/∂w_s, ∂/∂w_e]
         // λ* from the last forward bisection — use the SAME probability as the forward pass.
@@ -2257,7 +2314,7 @@ impl EntrolyEngine {
         // Reusing it here ensures advantage = (action − p_exact) × R is an unbiased estimator.
         let lambda = self.last_lambda_star;
 
-        for frag in self.fragments.values() {
+        for frag in self.fragments.values_mut() {
             // Linear score (pre-softcap — same landscape as forward pass)
             let score = self.w_recency   * frag.recency_score
                       + self.w_frequency * frag.frequency_score
@@ -2270,17 +2327,30 @@ impl EntrolyEngine {
             let p = Self::sigmoid((score - lambda * tc) / tau);
             let dp = p * (1.0 - p) / tau; // σ'(·/τ) — focuses gradient on marginal fragments
 
-            // REINFORCE baseline: advantage = (action - expected_action) × reward
-            // action = 1 if selected, 0 if not
-            // expected_action = p (exact KKT soft probability)
             let action = if selected.contains(frag.fragment_id.as_str()) { 1.0 } else { 0.0 };
-            let advantage = (action - p) * reward;
 
-            // Accumulate: advantage_i × σ'((s_i - λ*·tokens_i)/τ) × feature_{i,k}
-            g[0] += advantage * dp * frag.recency_score;
-            g[1] += advantage * dp * frag.frequency_score;
-            g[2] += advantage * dp * frag.semantic_score;
-            g[3] += advantage * dp * frag.entropy_score;
+            // ── Counterfactual credit: φᵢ modulates advantage ──
+            // Selected fragments: credit weighted by information share
+            // Non-selected: use uniform 1.0 (their "absence" signal is unmodulated)
+            let phi = if action > 0.5 {
+                (frag.entropy_score.max(0.01) / selected_entropy_sum).clamp(0.1, 3.0)
+            } else {
+                1.0
+            };
+
+            // ── Eligibility trace update ──
+            // Decay previous trace, add current "log-policy gradient" direction
+            let trace_update = (action - p) * dp;
+            frag.eligibility_trace = trace_lambda * frag.eligibility_trace + trace_update;
+
+            // Advantage = counterfactual_credit × eligibility_trace × reward
+            let advantage = phi * frag.eligibility_trace * reward;
+
+            // Accumulate: advantage_i × feature_{i,k}
+            g[0] += advantage * frag.recency_score;
+            g[1] += advantage * frag.frequency_score;
+            g[2] += advantage * frag.semantic_score;
+            g[3] += advantage * frag.entropy_score;
         }
 
 

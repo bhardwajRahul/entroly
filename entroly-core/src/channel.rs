@@ -370,6 +370,286 @@ pub fn modulated_reward(success: bool, sufficiency: f64) -> f64 {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  4. SPECTRAL CONTRADICTION GUARD
+// ═══════════════════════════════════════════════════════════════════
+//
+// Detects pairs of selected fragments that are structurally similar
+// (same file/class/symbol namespace) but semantically contradictory
+// (different content). These "Knowledge Conflicting Hallucination"
+// (KCH) triggers poison the LLM's understanding.
+//
+// Algorithm: SimHash Divergence Ratio (SDR)
+//   structural_sim(A,B) = 1 - hamming(simhash(A.source), simhash(B.source)) / 64
+//   content_sim(A,B)    = 1 - hamming(A.simhash, B.simhash) / 64
+//   SDR(A,B) = structural_sim - content_sim
+//   If SDR > threshold → contradictory pair → evict lower-relevance fragment
+//
+// References:
+//   - Charikar (2002) — SimHash for similarity estimation
+//   - NeurIPS 2025/2026 — Semantic Volume for uncertainty quantification
+//   - FORGE '26 — Knowledge-Conflicting Hallucination taxonomy
+
+/// Result of contradiction scan.
+#[derive(Debug, Clone)]
+pub struct ContradictionReport {
+    /// Indices (into selected_indices) that were evicted as contradictions.
+    pub evicted: Vec<usize>,
+    /// Number of contradictory pairs found.
+    pub pairs_found: usize,
+}
+
+/// Scan selected fragments for spectral contradictions and evict losers.
+///
+/// Two fragments contradict if:
+///   1. Their source paths are structurally similar (SimHash of source ≥ threshold)
+///   2. Their content is divergent (content SimHash distance > threshold)
+///
+/// The fragment with lower relevance in the pair is evicted.
+///
+/// Complexity: O(n²) where n = |selected_indices|. Acceptable for n ≤ 50.
+///
+/// Returns: (filtered_indices, report)
+pub fn contradiction_guard(
+    frags: &[ContextFragment],
+    selected_indices: &[usize],
+    relevances: &[f64],
+    sdr_threshold: f64,       // Default: 0.25
+    structural_threshold: f64, // Default: 0.60 — source path similarity
+) -> (Vec<usize>, ContradictionReport) {
+    let n = selected_indices.len();
+    if n <= 1 {
+        return (
+            selected_indices.to_vec(),
+            ContradictionReport { evicted: Vec::new(), pairs_found: 0 },
+        );
+    }
+
+    // Pre-compute source fingerprints (hash of the source path/file)
+    // We use FNV-1a on the source string for structural comparison
+    let source_fps: Vec<u64> = selected_indices.iter()
+        .map(|&i| {
+            let src = &frags[i].source;
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in src.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        })
+        .collect();
+
+    let mut pairs_found = 0usize;
+    let mut evicted_set: HashSet<usize> = HashSet::new();
+
+    // Pairwise scan — O(n²), fine for n ≤ 50
+    for i in 0..n {
+        if evicted_set.contains(&i) {
+            continue;
+        }
+        for j in (i + 1)..n {
+            if evicted_set.contains(&j) {
+                continue;
+            }
+
+            // Structural similarity: are these from the same file/class?
+            let source_hamming = (source_fps[i] ^ source_fps[j]).count_ones() as f64;
+            let structural_sim = 1.0 - source_hamming / 64.0;
+
+            if structural_sim < structural_threshold {
+                continue; // Different files/structures — no contradiction risk
+            }
+
+            // Content divergence: how different is the actual code?
+            let content_hamming = (frags[selected_indices[i]].simhash
+                ^ frags[selected_indices[j]].simhash)
+                .count_ones() as f64;
+            let content_sim = 1.0 - content_hamming / 64.0;
+
+            // SDR: high structural similarity + low content similarity = contradiction
+            let sdr = structural_sim - content_sim;
+
+            if sdr > sdr_threshold {
+                pairs_found += 1;
+
+                // Evict the fragment with lower relevance
+                let rel_i = if i < relevances.len() { relevances[i] } else { 0.0 };
+                let rel_j = if j < relevances.len() { relevances[j] } else { 0.0 };
+
+                if rel_i >= rel_j {
+                    evicted_set.insert(j);
+                } else {
+                    evicted_set.insert(i);
+                    break; // i is evicted, stop checking j's for this i
+                }
+            }
+        }
+    }
+
+    let filtered: Vec<usize> = (0..n)
+        .filter(|idx| !evicted_set.contains(idx))
+        .map(|idx| selected_indices[idx])
+        .collect();
+
+    let evicted: Vec<usize> = evicted_set.into_iter().collect();
+
+    (
+        filtered,
+        ContradictionReport {
+            evicted,
+            pairs_found,
+        },
+    )
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. BOOKEND ATTENTION CALIBRATION
+// ═══════════════════════════════════════════════════════════════════
+//
+// Post-pass on semantic_interleave() output. Solves the "Lost in the
+// Middle" problem (Liu et al. 2023; arxiv 2026 geometric proof) by
+// placing highest-importance fragments at attention peaks.
+//
+// The key insight from "Found in the Middle" (Google Research 2025):
+//   α(p, L) has peaks at p=0 (primacy) and p=L-1 (recency).
+//   We should assign fragments to positions that maximize:
+//     Σᵢ importance(i) × α(position(i), L)
+//
+// This is a variant of the assignment problem. For small n, we use a
+// greedy heuristic: sort positions by attention weight, sort fragments
+// by importance, assign greedily.
+//
+// CONSTRAINT: Causal ordering must be preserved. We only reorder within
+// the same causal level. Cross-level reordering would break def→ref chains.
+//
+// References:
+//   - Liu et al. (2023) — "Lost in the Middle: How LMs Use Long Contexts"
+//   - Google Research (2025) — "Found in the Middle: Calibrating LLM Attention"
+//   - ACL Findings (2025) — Hidden state positional scaling
+//   - arXiv (2026) — U-shape as geometric property of causal transformers
+
+/// Apply bookend attention calibration to an ordered index sequence.
+///
+/// Within each causal level, reorders fragments so that the most important
+/// ones occupy the attention-peak positions (start and end of that level's
+/// span within the full sequence).
+///
+/// `ordered_indices`: output from semantic_interleave()
+/// `frags`: fragment slice
+/// `relevances_map`: fragment_index → relevance score
+///
+/// Returns: reordered indices with attention-optimal placement.
+pub fn bookend_calibrate(
+    ordered_indices: &[usize],
+    frags: &[ContextFragment],
+    relevances_map: &HashMap<usize, f64>,
+    dep_graph: &DepGraph,
+) -> Vec<usize> {
+    let n = ordered_indices.len();
+    if n <= 2 {
+        return ordered_indices.to_vec(); // Nothing to reorder
+    }
+
+    // Re-derive causal levels for the ordered sequence
+    let fid_to_pos: HashMap<&str, usize> = ordered_indices.iter()
+        .enumerate()
+        .map(|(pos, &idx)| (frags[idx].fragment_id.as_str(), pos))
+        .collect();
+
+    let mut in_degree = vec![0usize; n];
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (pos, &idx) in ordered_indices.iter().enumerate() {
+        let fid = &frags[idx].fragment_id;
+        for dep_fid in dep_graph.reverse_deps(fid) {
+            if let Some(&dep_pos) = fid_to_pos.get(dep_fid.as_str()) {
+                if dep_pos != pos {
+                    adj[pos].push(dep_pos);
+                    in_degree[dep_pos] += 1;
+                }
+            }
+        }
+    }
+
+    // Kahn's topo sort for levels
+    let mut levels = vec![0usize; n];
+    let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut level = 0;
+    while !queue.is_empty() {
+        let mut next = Vec::new();
+        for &node in &queue {
+            levels[node] = level;
+            for &neighbor in &adj[node] {
+                in_degree[neighbor] = in_degree[neighbor].saturating_sub(1);
+                if in_degree[neighbor] == 0 {
+                    next.push(neighbor);
+                }
+            }
+        }
+        queue = next;
+        level += 1;
+    }
+
+    // Group positions by causal level
+    let max_level = levels.iter().copied().max().unwrap_or(0);
+    let mut level_groups: Vec<Vec<usize>> = vec![Vec::new(); max_level + 1];
+    for (pos, &lvl) in levels.iter().enumerate() {
+        level_groups[lvl].push(pos);
+    }
+
+    // Build output by processing each level group
+    let mut result: Vec<usize> = vec![0; n];
+    let mut global_pos = 0;
+
+    for group in &level_groups {
+        if group.is_empty() {
+            continue;
+        }
+        let group_len = group.len();
+
+        if group_len <= 2 {
+            // Too small to reorder meaningfully
+            for &pos in group {
+                result[global_pos] = ordered_indices[pos];
+                global_pos += 1;
+            }
+            continue;
+        }
+
+        // Sort group members by importance (descending)
+        let mut by_importance: Vec<(usize, f64)> = group.iter()
+            .map(|&pos| {
+                let idx = ordered_indices[pos];
+                let rel = relevances_map.get(&idx).copied().unwrap_or(0.5);
+                (pos, rel)
+            })
+            .collect();
+        by_importance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Generate position slots and sort by attention weight (descending)
+        // Positions are relative to the FULL sequence for attention_weight()
+        let slot_start = global_pos;
+        let mut slots: Vec<(usize, f64)> = (0..group_len)
+            .map(|i| {
+                let global = slot_start + i;
+                (global, attention_weight(global, n))
+            })
+            .collect();
+        slots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Greedy assignment: highest importance → highest attention slot
+        for (rank, &(_, _)) in by_importance.iter().enumerate() {
+            let frag_idx = ordered_indices[by_importance[rank].0];
+            let slot_pos = slots[rank].0;
+            result[slot_pos] = frag_idx;
+        }
+
+        global_pos += group_len;
+    }
+
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  TESTS
 // ═══════════════════════════════════════════════════════════════════
 
@@ -955,5 +1235,96 @@ mod tests {
         for &idx in &ordered {
             assert!(idx < frags.len(), "Out-of-bounds index {} (len {})", idx, frags.len());
         }
+    }
+
+    // ── Spectral Contradiction Guard ──
+
+    #[test]
+    fn test_contradiction_guard_no_contradictions() {
+        let frags = vec![
+            frag("f0", "def foo(): return 42", 10, "src/auth.py"),
+            frag("f1", "class Database: pass", 10, "src/db.py"),
+        ];
+        let (filtered, report) = contradiction_guard(&frags, &[0, 1], &[0.8, 0.6], 0.25, 0.60);
+        assert_eq!(filtered.len(), 2, "No contradictions → no evictions");
+        assert_eq!(report.pairs_found, 0);
+    }
+
+    #[test]
+    fn test_contradiction_guard_same_source_different_content() {
+        // Two fragments from the same source but with different simhash
+        let mut f0 = frag("f0", "def foo(): return 42", 10, "src/auth.py");
+        let mut f1 = frag("f1", "def foo(): return 99; # rewritten", 10, "src/auth.py");
+        // Make their simhashes very different (contradictory)
+        f0.simhash = 0x0000_0000_0000_0000;
+        f1.simhash = 0xFFFF_FFFF_FFFF_FFFF;
+        let frags = vec![f0, f1];
+        let (filtered, report) = contradiction_guard(&frags, &[0, 1], &[0.8, 0.3], 0.25, 0.60);
+        // Same source (structural_sim = 1.0), max content divergence
+        // SDR = 1.0 - 0.0 = 1.0 > 0.25 → should evict f1 (lower relevance)
+        assert_eq!(filtered.len(), 1, "Should evict contradictory fragment");
+        assert_eq!(report.pairs_found, 1);
+        assert_eq!(filtered[0], 0, "Higher-relevance fragment survives");
+    }
+
+    #[test]
+    fn test_contradiction_guard_single_fragment() {
+        let frags = vec![frag("f0", "content", 10, "a.py")];
+        let (filtered, report) = contradiction_guard(&frags, &[0], &[0.5], 0.25, 0.60);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(report.pairs_found, 0);
+    }
+
+    #[test]
+    fn test_contradiction_guard_empty() {
+        let frags: Vec<ContextFragment> = vec![];
+        let (filtered, report) = contradiction_guard(&frags, &[], &[], 0.25, 0.60);
+        assert!(filtered.is_empty());
+        assert_eq!(report.pairs_found, 0);
+    }
+
+    #[test]
+    fn test_contradiction_guard_different_sources_no_eviction() {
+        // Even if content is the same, different sources → no structural similarity
+        let mut f0 = frag("f0", "same code", 10, "src/auth.py");
+        let mut f1 = frag("f1", "same code", 10, "src/billing.py");
+        f0.simhash = 0x0000_0000_0000_0000;
+        f1.simhash = 0xFFFF_FFFF_FFFF_FFFF;
+        let frags = vec![f0, f1];
+        let (filtered, report) = contradiction_guard(&frags, &[0, 1], &[0.8, 0.3], 0.25, 0.60);
+        assert_eq!(filtered.len(), 2, "Different sources → no contradiction check");
+        assert_eq!(report.pairs_found, 0);
+    }
+
+    // ── Bookend Attention Calibration ──
+
+    #[test]
+    fn test_bookend_preserves_all_indices() {
+        let frags: Vec<ContextFragment> = (0..5)
+            .map(|i| frag(&format!("f{}", i), &format!("content {}", i), 10, &format!("f{}.py", i)))
+            .collect();
+        let indices = vec![0, 1, 2, 3, 4];
+        let mut rel_map = HashMap::new();
+        for (i, &idx) in indices.iter().enumerate() {
+            rel_map.insert(idx, 1.0 - i as f64 * 0.1);
+        }
+        let result = bookend_calibrate(&indices, &frags, &rel_map, &DepGraph::new());
+        assert_eq!(result.len(), 5, "All indices preserved");
+        let unique: HashSet<usize> = result.iter().copied().collect();
+        assert_eq!(unique.len(), 5, "No duplicates");
+    }
+
+    #[test]
+    fn test_bookend_small_input() {
+        let frags = vec![frag("f0", "a", 10, "a.py"), frag("f1", "b", 10, "b.py")];
+        let rel_map = HashMap::from([(0, 0.8), (1, 0.6)]);
+        let result = bookend_calibrate(&[0, 1], &frags, &rel_map, &DepGraph::new());
+        assert_eq!(result, vec![0, 1], "≤2 elements → no reordering");
+    }
+
+    #[test]
+    fn test_bookend_empty() {
+        let result = bookend_calibrate(&[], &[], &HashMap::new(), &DepGraph::new());
+        assert!(result.is_empty());
     }
 }

@@ -52,6 +52,12 @@ pub struct ContextFragment {
     #[pyo3(get, set)]
     #[serde(default)]
     pub skeleton_token_count: Option<u32>,
+
+    // RL eligibility trace for TD(λ) temporal credit assignment.
+    // Accumulates decaying credit: e_i(t) = λ·e_i(t-1) + ∂log π / ∂θ.
+    // Fragments selected in recent requests receive attenuated reward.
+    #[serde(default)]
+    pub eligibility_trace: f64,
 }
 
 #[pymethods]
@@ -80,6 +86,7 @@ impl ContextFragment {
             simhash: 0,
             skeleton_content: None,
             skeleton_token_count: None,
+            eligibility_trace: 0.0,
         }
     }
 }
