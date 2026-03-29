@@ -262,7 +262,7 @@ def _py_knapsack_optimize(
     candidates = [f for f in fragments if not f.is_pinned]
 
     pinned_tokens = sum(f.token_count for f in pinned)
-    remaining_budget = max(0, token_budget - pinned_tokens)
+    max(0, token_budget - pinned_tokens)
 
     # Score and sort candidates by relevance/token ratio (greedy)
     scored = []
@@ -1474,7 +1474,7 @@ def create_mcp_server():
             },
             "🔒 safety": {
                 "duplicates_blocked": dupes,
-                "stale_fragments_deprioritized": f"Ebbinghaus decay active (half-life: 15 turns)",
+                "stale_fragments_deprioritized": "Ebbinghaus decay active (half-life: 15 turns)",
                 "persistent_index": "active" if hasattr(engine, '_index_path') else "disabled",
                 "checkpoints": checkpoint.get("total_checkpoints", 0),
             },

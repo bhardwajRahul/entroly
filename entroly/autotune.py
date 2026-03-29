@@ -443,7 +443,7 @@ def run_autotune(iterations: int = 100,
         else:
             print("  → Best single config is better — keeping it")
 
-    print(f"\n--- Summary ---")
+    print("\n--- Summary ---")
     print(f"Total experiments: {iterations}")
     print(f"Improvements found: {improvements}")
     print(f"Baseline score: {baseline_score:.4f}")

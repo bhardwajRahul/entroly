@@ -209,7 +209,7 @@ def _format_image_content(
         f"# Visual Content: {source}",
         f"## Extraction: {method} (confidence: {confidence:.0%})",
         "",
-        f"### UI Regions Detected",
+        "### UI Regions Detected",
         *[f"- {r}" for r in regions],
         "",
         "### Extracted Content",
@@ -835,8 +835,8 @@ def _extract_diff_symbols(diff_text: str) -> List[str]:
 
 
 def _count_diff_lines(diff_text: str) -> Tuple[int, int]:
-    adds = sum(1 for l in diff_text.splitlines() if l.startswith("+") and not l.startswith("+++"))
-    removes = sum(1 for l in diff_text.splitlines() if l.startswith("-") and not l.startswith("---"))
+    adds = sum(1 for line in diff_text.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    removes = sum(1 for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---"))
     return adds, removes
 
 
@@ -855,7 +855,7 @@ def _format_diff_content(
         "",
     ]
     if commit_msg:
-        lines += [f"## Commit Message", f"> {commit_msg}", ""]
+        lines += ["## Commit Message", f"> {commit_msg}", ""]
 
     if symbols:
         lines += ["## Symbols Changed", " ".join(symbols), ""]

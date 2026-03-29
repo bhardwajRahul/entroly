@@ -530,12 +530,8 @@ impl EntrolyEngine {
                 let coin = (hasher.finish() % 10000) as f64 / 10000.0;
                 coin < self.exploration_rate
             } else {
-                // Rate == 0: pure UCB criterion — explore only when warranted.
-                self.fragments.keys().any(|fid| {
-                    let ucb = self.feedback.ucb_score(fid, alpha_0);
-                    let visits = self.feedback.visit_count(fid) as f64;
-                    ucb > best_exploit && visits < visit_threshold
-                })
+                // Rate == 0: exploration explicitly disabled.
+                false
             };
 
             // ── EGSC Cache: check for a cached optimization result ──

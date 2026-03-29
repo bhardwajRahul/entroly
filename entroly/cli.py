@@ -850,7 +850,7 @@ def cmd_export(args):
     print(f"\n{C.CYAN}{C.BOLD}  Entroly Export{C.RESET}\n")
 
     entroly_dir = Path.home() / ".entroly"
-    checkpoint_dir = entroly_dir / "checkpoints"
+    entroly_dir / "checkpoints"
     tuning_config = Path(os.path.dirname(__file__)).parent / "tuning_config.json"
 
     export_data = {
@@ -994,7 +994,7 @@ def cmd_profile(args):
             print(f"  {C.CYAN}{name}{C.RESET} ({size} bytes)")
 
     else:
-        print(f"  Usage: entroly profile {{save|load|list}} [name]")
+        print("  Usage: entroly profile {save|load|list} [name]")
 
 
 def cmd_batch(args):
@@ -1172,14 +1172,14 @@ def cmd_demo(args):
         total_tokens_raw = result["total_tokens"]
         if files_indexed == 0:
             print(f"  {C.YELLOW}No files found to index.{C.RESET}")
-            print(f"  Run this from a project directory with source files.\n")
+            print("  Run this from a project directory with source files.\n")
             return
         print(f"  {C.GREEN}Indexed {files_indexed} files ({total_tokens_raw:,} tokens total){C.RESET}\n")
     elif result["status"] == "skipped":
         existing = result.get("existing_fragments", 0)
         if existing == 0:
             print(f"  {C.YELLOW}No files found to index.{C.RESET}")
-            print(f"  Run this from a project directory with source files.\n")
+            print("  Run this from a project directory with source files.\n")
             return
         if engine._use_rust:
             stats = engine._rust.stats()
@@ -1190,7 +1190,7 @@ def cmd_demo(args):
         print(f"  {C.GREEN}Using persistent index: {files_indexed} fragments ({total_tokens_raw:,} tokens total){C.RESET}\n")
     else:
         print(f"  {C.YELLOW}No files found to index.{C.RESET}")
-        print(f"  Run this from a project directory with source files.\n")
+        print("  Run this from a project directory with source files.\n")
         return
 
     # Smart quality recommendation

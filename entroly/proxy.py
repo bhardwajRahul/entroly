@@ -1217,15 +1217,15 @@ class PromptCompilerProxy:
             except httpx.ReadError as e:
                 self._breaker.record_failure()
                 logger.warning(f"Upstream stream interrupted: {e}")
-                yield f'data: {{"error": "upstream_connection_lost"}}\n\n'.encode()
+                yield 'data: {"error": "upstream_connection_lost"}\n\n'.encode()
             except httpx.TimeoutException as e:
                 self._breaker.record_failure()
                 logger.warning(f"Upstream stream timeout: {e}")
-                yield f'data: {{"error": "upstream_timeout"}}\n\n'.encode()
+                yield 'data: {"error": "upstream_timeout"}\n\n'.encode()
             except Exception as e:
                 self._breaker.record_failure()
                 logger.warning(f"Unexpected stream error: {e}")
-                yield f'data: {{"error": "stream_error"}}\n\n'.encode()
+                yield 'data: {"error": "stream_error"}\n\n'.encode()
 
             # ── Signal 1: Assess response after stream completes ──
             # REVOLUTIONARY FIX: Eliminate the dead zone.
@@ -1513,32 +1513,32 @@ async def _metrics_prometheus(request: Request) -> StreamingResponse:
     proxy = request.app.state.proxy
     with proxy._stats_lock:
         lines = [
-            f"# HELP entroly_requests_total Total proxy requests",
-            f"# TYPE entroly_requests_total counter",
+            "# HELP entroly_requests_total Total proxy requests",
+            "# TYPE entroly_requests_total counter",
             f"entroly_requests_total {proxy._requests_total}",
-            f"# HELP entroly_requests_optimized Optimized requests",
-            f"# TYPE entroly_requests_optimized counter",
+            "# HELP entroly_requests_optimized Optimized requests",
+            "# TYPE entroly_requests_optimized counter",
             f"entroly_requests_optimized {proxy._requests_optimized}",
-            f"# HELP entroly_requests_bypassed Bypassed requests",
-            f"# TYPE entroly_requests_bypassed counter",
+            "# HELP entroly_requests_bypassed Bypassed requests",
+            "# TYPE entroly_requests_bypassed counter",
             f"entroly_requests_bypassed {proxy._requests_bypassed}",
-            f"# HELP entroly_tokens_original_total Original token count",
-            f"# TYPE entroly_tokens_original_total counter",
+            "# HELP entroly_tokens_original_total Original token count",
+            "# TYPE entroly_tokens_original_total counter",
             f"entroly_tokens_original_total {proxy._total_original_tokens}",
-            f"# HELP entroly_tokens_optimized_total Optimized token count",
-            f"# TYPE entroly_tokens_optimized_total counter",
+            "# HELP entroly_tokens_optimized_total Optimized token count",
+            "# TYPE entroly_tokens_optimized_total counter",
             f"entroly_tokens_optimized_total {proxy._total_optimized_tokens}",
-            f"# HELP entroly_pipeline_latency_ms Pipeline latency",
-            f"# TYPE entroly_pipeline_latency_ms gauge",
+            "# HELP entroly_pipeline_latency_ms Pipeline latency",
+            "# TYPE entroly_pipeline_latency_ms gauge",
             f"entroly_pipeline_latency_ms {proxy._pipeline_stats.mean:.2f}",
-            f"# HELP entroly_circuit_breaker Circuit breaker state (0=closed, 1=open)",
-            f"# TYPE entroly_circuit_breaker gauge",
+            "# HELP entroly_circuit_breaker Circuit breaker state (0=closed, 1=open)",
+            "# TYPE entroly_circuit_breaker gauge",
             f'entroly_circuit_breaker {1 if proxy._breaker.state == "open" else 0}',
-            f"# HELP entroly_outcome_success Successful outcomes recorded",
-            f"# TYPE entroly_outcome_success counter",
+            "# HELP entroly_outcome_success Successful outcomes recorded",
+            "# TYPE entroly_outcome_success counter",
             f"entroly_outcome_success {proxy._outcome_success}",
-            f"# HELP entroly_outcome_failure Failed outcomes recorded",
-            f"# TYPE entroly_outcome_failure counter",
+            "# HELP entroly_outcome_failure Failed outcomes recorded",
+            "# TYPE entroly_outcome_failure counter",
             f"entroly_outcome_failure {proxy._outcome_failure}",
         ]
 
@@ -1842,7 +1842,6 @@ async def _proxy_stats(request: Request) -> JSONResponse:
 
 
 # Need os for ENTROLY_RATE_LIMIT env var
-import os  # noqa: E402
 
 
 def create_proxy_app(
