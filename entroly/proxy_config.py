@@ -206,6 +206,7 @@ class ProxyConfig:
     enable_prompt_directives: bool = True
     enable_hierarchical_compression: bool = True
     enable_conversation_compression: bool = True
+    enable_passive_feedback: bool = True
 
     # Context window size (auto-detected per model, this is the fallback)
     context_window: int = 128_000
