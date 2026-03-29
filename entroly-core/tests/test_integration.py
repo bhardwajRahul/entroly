@@ -399,7 +399,7 @@ test("Record failure", test_feedback_failure)
 
 def test_feedback_affects_ranking():
     """Fragments with positive feedback should rank higher."""
-    e = sc.EntrolyEngine()
+    e = sc.EntrolyEngine(exploration_rate=0.0)
     r1 = e.ingest("def good(): return 1", "good.py", 50, False)
     r2 = e.ingest("def bad(): return 0", "bad.py", 50, False)
     # Record lots of success for good, lots of failure for bad
@@ -770,7 +770,7 @@ def test_optimize_uses_skeleton_when_budget_tight():
     # Verify we get either full or skeleton variants
     variants = [f.get("variant", "full") for f in result["selected"]]
     assert len(result["selected"]) > 0, "Should select at least 1 fragment"
-    assert all(v in ("full", "skeleton") for v in variants), \
+    assert all(v in ("full", "skeleton", "reference") for v in variants), \
         f"Unexpected variant values: {variants}"
 test("Optimize uses skeleton variants to fill budget", test_optimize_uses_skeleton_when_budget_tight)
 
@@ -794,7 +794,7 @@ def test_optimize_variant_field_always_present():
     for frag in result["selected"]:
         assert "variant" in frag, \
             f"Fragment missing 'variant' field: {list(frag.keys())}"
-        assert frag["variant"] in ("full", "skeleton"), \
+        assert frag["variant"] in ("full", "skeleton", "reference"), \
             f"Invalid variant value: {frag['variant']}"
 test("Every selected fragment has a valid 'variant' field", test_optimize_variant_field_always_present)
 
