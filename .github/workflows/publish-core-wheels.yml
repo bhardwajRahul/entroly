@@ -62,7 +62,7 @@ jobs:
 
   macos-x86_64:
     name: macOS (x86_64 — Intel)
-    runs-on: macos-13
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
