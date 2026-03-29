@@ -57,7 +57,7 @@ use serde::{Serialize, Deserialize};
 
 /// A symmetric pair key — order-independent.
 /// Always stores (min, max) to ensure R[a][b] == R[b][a].
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PairKey(String, String);
 
 impl PairKey {
@@ -67,6 +67,57 @@ impl PairKey {
         } else {
             PairKey(b.to_string(), a.to_string())
         }
+    }
+
+    /// Convert to a string key for JSON serialization.
+    fn to_key_string(&self) -> String {
+        format!("{}::{}", self.0, self.1)
+    }
+
+    /// Parse from a string key.
+    fn from_key_string(s: &str) -> Option<Self> {
+        let mut parts = s.splitn(2, "::");
+        let a = parts.next()?;
+        let b = parts.next()?;
+        Some(PairKey::new(a, b))
+    }
+}
+
+/// Custom serde for HashMap<PairKey, V> — JSON requires string keys.
+mod pair_key_map_serde {
+    use super::*;
+    use serde::ser::SerializeMap;
+    use serde::de::{self, MapAccess, Visitor};
+    use std::fmt;
+
+    pub fn serialize<S>(map: &HashMap<PairKey, super::ResonanceEntry>, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        let mut ser_map = serializer.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            ser_map.serialize_entry(&k.to_key_string(), v)?;
+        }
+        ser_map.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<PairKey, super::ResonanceEntry>, D::Error>
+    where D: serde::Deserializer<'de> {
+        struct PairKeyMapVisitor;
+        impl<'de> Visitor<'de> for PairKeyMapVisitor {
+            type Value = HashMap<PairKey, super::ResonanceEntry>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map with 'a::b' string keys")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Self::Value, M::Error> {
+                let mut map = HashMap::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some((key_str, value)) = access.next_entry::<String, super::ResonanceEntry>()? {
+                    let key = PairKey::from_key_string(&key_str)
+                        .ok_or_else(|| de::Error::custom(format!("invalid pair key: {key_str}")))?;
+                    map.insert(key, value);
+                }
+                Ok(map)
+            }
+        }
+        deserializer.deserialize_map(PairKeyMapVisitor)
     }
 }
 
@@ -83,21 +134,9 @@ struct ResonanceEntry {
 
 /// The Resonance Matrix — learns which fragment pairs produce synergistic
 /// LLM outputs through outcome tracking.
-///
-/// # Design Decisions
-///
-/// 1. **Sparse HashMap** over dense matrix: N fragments → N² pairs is
-///    prohibitive for N > 1000. In practice, only ~5-20 fragments are
-///    co-selected per optimize() call, so the active pair count grows
-///    linearly with optimizations, not quadratically with fragments.
-///
-/// 2. **Symmetric storage**: PairKey normalizes order, halving storage.
-///
-/// 3. **Wilson-inspired confidence**: raw strength is modulated by
-///    co_selections count before use, so a pair seen once doesn't
-///    dominate over a well-established pair.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResonanceMatrix {
+    #[serde(with = "pair_key_map_serde")]
     pairs: HashMap<PairKey, ResonanceEntry>,
     /// Learning rate for resonance updates.
     eta: f64,
