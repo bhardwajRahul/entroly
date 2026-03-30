@@ -1066,6 +1066,11 @@ class PromptCompilerProxy:
         self._last_resonance_pairs = result.get("resonance_pairs", 0)
         self._last_resonance_strength = result.get("resonance_strength", 0.0)
         self._last_w_resonance = result.get("w_resonance", 0.0)
+        # Causal Context Graph diagnostics
+        self._last_causal_tracked = result.get("causal_tracked", 0)
+        self._last_causal_interventional = result.get("causal_interventional", 0)
+        self._last_causal_gravity_sources = result.get("causal_gravity_sources", 0)
+        self._last_causal_mean_mass = result.get("causal_mean_mass", 0.0)
 
         # Build refinement info for the context block
         refinement_info = None
@@ -1298,6 +1303,12 @@ class PromptCompilerProxy:
                 resp_headers["X-Entroly-Resonance-Pairs"] = str(self._last_resonance_pairs)
                 resp_headers["X-Entroly-Resonance-Strength"] = f"{self._last_resonance_strength:.4f}"
                 resp_headers["X-Entroly-W-Resonance"] = f"{self._last_w_resonance:.4f}"
+            # Causal Context Graph headers
+            if hasattr(self, '_last_causal_tracked') and self._last_causal_tracked > 0:
+                resp_headers["X-Entroly-Causal-Tracked"] = str(self._last_causal_tracked)
+                resp_headers["X-Entroly-Causal-Interventional"] = str(self._last_causal_interventional)
+                resp_headers["X-Entroly-Causal-Gravity-Sources"] = str(self._last_causal_gravity_sources)
+                resp_headers["X-Entroly-Causal-Mean-Mass"] = f"{self._last_causal_mean_mass:.4f}"
 
         return StreamingResponse(
             event_generator(),
@@ -1397,6 +1408,12 @@ class PromptCompilerProxy:
                 resp_headers["X-Entroly-Resonance-Pairs"] = str(self._last_resonance_pairs)
                 resp_headers["X-Entroly-Resonance-Strength"] = f"{self._last_resonance_strength:.4f}"
                 resp_headers["X-Entroly-W-Resonance"] = f"{self._last_w_resonance:.4f}"
+            # Causal Context Graph headers (non-streaming path)
+            if hasattr(self, '_last_causal_tracked') and self._last_causal_tracked > 0:
+                resp_headers["X-Entroly-Causal-Tracked"] = str(self._last_causal_tracked)
+                resp_headers["X-Entroly-Causal-Interventional"] = str(self._last_causal_interventional)
+                resp_headers["X-Entroly-Causal-Gravity-Sources"] = str(self._last_causal_gravity_sources)
+                resp_headers["X-Entroly-Causal-Mean-Mass"] = f"{self._last_causal_mean_mass:.4f}"
 
         # Validate response content-type before parsing JSON
         content_type = response.headers.get("content-type", "")

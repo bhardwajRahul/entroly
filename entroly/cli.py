@@ -718,6 +718,17 @@ def cmd_status(args):
             if total_c > 0:
                 print(f"\n  {C.BOLD}Fragment Consolidation (Maxwell's Demon):{C.RESET}")
                 print(f"    Consolidated: {total_c} fragments  |  Tokens saved: {tokens_c}")
+        causal = engine_stats.get("causal", {})
+        if causal:
+            traces = causal.get("total_traces", 0)
+            tracked = causal.get("tracked_fragments", 0)
+            interventional = causal.get("interventional_fragments", 0)
+            temporal = causal.get("temporal_links", 0)
+            gravity = causal.get("gravity_sources", 0)
+            mass = causal.get("mean_causal_mass", 0.0)
+            print(f"\n  {C.BOLD}Causal Context Graph:{C.RESET}")
+            print(f"    Traces: {traces}  |  Tracked: {tracked}  |  Interventional: {interventional}")
+            print(f"    Temporal links: {temporal}  |  Gravity sources: {gravity}  |  Mean mass: {mass:.4f}")
     except Exception:
         pass
 

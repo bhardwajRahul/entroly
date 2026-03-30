@@ -184,9 +184,21 @@ def _get_full_snapshot() -> dict:
             "total_consolidations": consolidation.get("total_consolidations", 0),
             "tokens_saved": consolidation.get("tokens_saved", 0),
         })
+        # Causal Context Graph stats
+        causal = stats.get("causal", {}) if isinstance(stats.get("causal"), dict) else {}
+        snap["causal"] = _safe_json({
+            "total_traces": causal.get("total_traces", 0),
+            "tracked_fragments": causal.get("tracked_fragments", 0),
+            "interventional_fragments": causal.get("interventional_fragments", 0),
+            "temporal_links": causal.get("temporal_links", 0),
+            "gravity_sources": causal.get("gravity_sources", 0),
+            "mean_causal_mass": causal.get("mean_causal_mass", 0.0),
+            "base_rate": causal.get("base_rate", 0.0),
+        })
     except Exception:
         snap["resonance"] = None
         snap["consolidation"] = None
+        snap["causal"] = None
 
     # 9. Recent proxy requests
     with _lock:

@@ -34,6 +34,7 @@ mod nkbe;
 mod cognitive_bus;
 mod cache;
 mod resonance;
+mod causal;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -53,6 +54,7 @@ use prism::PrismOptimizer5D;
 use query_persona::QueryPersonaManifold;
 use cache::CacheLookup;
 use resonance::ResonanceMatrix;
+use causal::CausalContextGraph;
 
 
 /// Process-wide monotonic counter — used only to seed each engine's instance_id.
@@ -195,6 +197,17 @@ pub struct EntrolyEngine {
     consolidation_tokens_saved: u64,
     /// Hamming threshold for consolidation (wider than dedup: catches near-duplicates).
     consolidation_hamming_threshold: u32,
+
+    // ── Causal Context Graph (Interventional Estimation + Information Gravity) ──
+    /// Learns true causal effects via do-calculus on exploration data,
+    /// discovers temporal causal chains, computes information gravity field.
+    causal_graph: CausalContextGraph,
+    /// Whether the causal context graph is enabled.
+    enable_causal: bool,
+    /// Previous turn's selected fragment IDs (for temporal chain learning).
+    prev_selected_ids: Vec<String>,
+    /// Previous turn's explored fragment IDs (for temporal chain learning).
+    prev_explored_ids: Vec<String>,
 }
 
 /// Snapshot of the last optimization for explainability.
@@ -320,6 +333,11 @@ impl EntrolyEngine {
             total_consolidations: 0,
             consolidation_tokens_saved: 0,
             consolidation_hamming_threshold: 8, // wider than dedup (3) to catch near-dupes
+            // Causal Context Graph
+            causal_graph: CausalContextGraph::new(),
+            enable_causal: true,
+            prev_selected_ids: Vec::new(),
+            prev_explored_ids: Vec::new(),
         }
     }
 
@@ -366,6 +384,11 @@ impl EntrolyEngine {
         // stable than individual recency.
         if self.enable_resonance {
             self.resonance_matrix.decay_tick();
+        }
+
+        // ── Causal Context Graph: evict stale temporal links ──
+        if self.enable_causal {
+            self.causal_graph.decay_tick(self.current_turn);
         }
 
         // ── Maxwell's Demon: Fragment Consolidation ──
@@ -788,6 +811,29 @@ impl EntrolyEngine {
                 HashMap::new()
             };
 
+            // ── Causal Context Graph: gravity + temporal bonuses ──
+            // Information gravity: causally important fragments get a retrieval bonus.
+            // Temporal chains: fragments enabled by previous selection get a bonus.
+            let causal_gravity: HashMap<String, f64> = if self.enable_causal && !self.causal_graph.is_empty() {
+                let candidate_refs: Vec<&str> = frags.iter()
+                    .map(|f| f.fragment_id.as_str())
+                    .collect();
+                self.causal_graph.gravity_bonuses(&candidate_refs)
+            } else {
+                HashMap::new()
+            };
+            let causal_temporal: HashMap<String, f64> = if self.enable_causal && !self.causal_graph.is_empty() {
+                let candidate_refs: Vec<&str> = frags.iter()
+                    .map(|f| f.fragment_id.as_str())
+                    .collect();
+                let prev_refs: Vec<&str> = self.prev_selected_ids.iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                self.causal_graph.temporal_bonuses(&candidate_refs, &prev_refs)
+            } else {
+                HashMap::new()
+            };
+
             // ── Coverage Estimator: capture semantic vs structural candidate sets ──
             // N₁ = semantic candidates (fragments with semantic_score > threshold)
             let semantic_threshold = 0.15;
@@ -824,6 +870,17 @@ impl EntrolyEngine {
                             frag.semantic_score = (frag.semantic_score + resonance_effect).clamp(0.0, 1.0);
                         }
                     }
+                }
+                // ── Causal Context Graph: gravity + temporal bonuses ──
+                // Applied to ALL fragments (not just unselected) because gravity
+                // represents true causal importance, not just pairwise interaction.
+                if let Some(&grav) = causal_gravity.get(&frag.fragment_id) {
+                    // Gravity: additive boost scaled by 0.15 (moderate influence)
+                    frag.semantic_score = (frag.semantic_score + 0.15 * grav).clamp(0.0, 1.0);
+                }
+                if let Some(&temp) = causal_temporal.get(&frag.fragment_id) {
+                    // Temporal: additive boost scaled by 0.10 (subtler influence)
+                    frag.semantic_score = (frag.semantic_score + 0.10 * temp).clamp(0.0, 1.0);
                 }
             }
 
@@ -1275,6 +1332,16 @@ impl EntrolyEngine {
                 py_result.set_item("w_resonance", (self.w_resonance * 10000.0).round() / 10000.0)?;
             }
 
+            // ── Causal Context Graph diagnostics ──
+            if self.enable_causal && !self.causal_graph.is_empty() {
+                let cs = self.causal_graph.stats();
+                py_result.set_item("causal_tracked", cs.tracked_fragments)?;
+                py_result.set_item("causal_interventional", cs.interventional_fragments)?;
+                py_result.set_item("causal_gravity_sources", cs.gravity_sources)?;
+                py_result.set_item("causal_mean_mass", (cs.mean_causal_mass * 10000.0).round() / 10000.0)?;
+                py_result.set_item("causal_temporal_links", cs.temporal_links)?;
+            }
+
             // Selected fragment details (in LLM-optimal order)
             let selected_list = pyo3::types::PyList::empty(py);
             for &idx in &ordered_indices {
@@ -1393,6 +1460,17 @@ impl EntrolyEngine {
                     &query, current_frag_ids, &entropies,
                     response_json, final_tokens, self.current_turn, effective_budget,
                 );
+            }
+
+            // ── Causal Context Graph: store selected/explored for feedback path ──
+            // These are used by record_success/failure/reward to build CausalTraces.
+            if self.enable_causal {
+                let all_selected: Vec<String> = ordered_indices.iter()
+                    .chain(skeleton_indices.iter())
+                    .map(|&i| frags[i].fragment_id.clone())
+                    .collect();
+                self.prev_selected_ids = all_selected;
+                self.prev_explored_ids = explored_ids;
             }
 
             Ok(py_result.into())
@@ -1644,6 +1722,47 @@ impl EntrolyEngine {
             consol.set_item("tokens_saved", self.consolidation_tokens_saved)?;
             result.set_item("consolidation", consol)?;
 
+            // ── Causal Context Graph stats ──
+            if self.enable_causal {
+                let cs = self.causal_graph.stats();
+                let causal_dict = PyDict::new(py);
+                causal_dict.set_item("total_traces", cs.total_traces)?;
+                causal_dict.set_item("stored_traces", cs.stored_traces)?;
+                causal_dict.set_item("tracked_fragments", cs.tracked_fragments)?;
+                causal_dict.set_item("interventional_fragments", cs.interventional_fragments)?;
+                causal_dict.set_item("temporal_links", cs.temporal_links)?;
+                causal_dict.set_item("gravity_sources", cs.gravity_sources)?;
+                causal_dict.set_item("mean_causal_mass", (cs.mean_causal_mass * 10000.0).round() / 10000.0)?;
+                causal_dict.set_item("base_rate", (cs.base_rate * 10000.0).round() / 10000.0)?;
+                causal_dict.set_item("total_interventional_updates", cs.total_interventional_updates)?;
+                causal_dict.set_item("total_temporal_updates", cs.total_temporal_updates)?;
+                // Top causal fragments (for dashboard)
+                let top_causal = self.causal_graph.top_causal_fragments(5);
+                let top_causal_list = pyo3::types::PyList::empty(py);
+                for (fid, effect, bias, conf) in &top_causal {
+                    let d = PyDict::new(py);
+                    d.set_item("id", fid.as_str())?;
+                    d.set_item("causal_effect", (*effect * 10000.0).round() / 10000.0)?;
+                    d.set_item("confounding_bias", (*bias * 10000.0).round() / 10000.0)?;
+                    d.set_item("confidence", (*conf * 10000.0).round() / 10000.0)?;
+                    top_causal_list.append(d)?;
+                }
+                causal_dict.set_item("top_fragments", top_causal_list)?;
+                // Top temporal chains
+                let top_chains = self.causal_graph.top_temporal_chains(5);
+                let top_chains_list = pyo3::types::PyList::empty(py);
+                for (src, tgt, effect, conf) in &top_chains {
+                    let d = PyDict::new(py);
+                    d.set_item("source", src.as_str())?;
+                    d.set_item("target", tgt.as_str())?;
+                    d.set_item("temporal_effect", (*effect * 10000.0).round() / 10000.0)?;
+                    d.set_item("confidence", (*conf * 10000.0).round() / 10000.0)?;
+                    top_chains_list.append(d)?;
+                }
+                causal_dict.set_item("top_chains", top_chains_list)?;
+                result.set_item("causal", causal_dict)?;
+            }
+
             Ok(result.into())
         })
     }
@@ -1849,6 +1968,17 @@ impl EntrolyEngine {
         if self.enable_resonance {
             self.resonance_matrix.record_outcome(&fragment_ids, advantage, self.current_turn);
         }
+        // Causal Context Graph: record trace with interventional data
+        if self.enable_causal {
+            let query_hash = dedup::simhash(&self.last_query);
+            self.causal_graph.record_trace(
+                self.current_turn,
+                query_hash,
+                &self.prev_selected_ids,
+                &self.prev_explored_ids,
+                advantage,
+            );
+        }
         self.apply_prism_rl_update(&fragment_ids, advantage);
     }
 
@@ -1883,6 +2013,17 @@ impl EntrolyEngine {
         // Context Resonance: learn pairwise interaction strengths (negative signal)
         if self.enable_resonance {
             self.resonance_matrix.record_outcome(&fragment_ids, advantage, self.current_turn);
+        }
+        // Causal Context Graph: record trace with interventional data
+        if self.enable_causal {
+            let query_hash = dedup::simhash(&self.last_query);
+            self.causal_graph.record_trace(
+                self.current_turn,
+                query_hash,
+                &self.prev_selected_ids,
+                &self.prev_explored_ids,
+                advantage,
+            );
         }
         self.apply_prism_rl_update(&fragment_ids, advantage);
     }
@@ -1932,6 +2073,17 @@ impl EntrolyEngine {
         // Context Resonance: continuous reward signal for pairwise learning
         if self.enable_resonance {
             self.resonance_matrix.record_outcome(&fragment_ids, advantage, self.current_turn);
+        }
+        // Causal Context Graph: continuous reward signal for interventional learning
+        if self.enable_causal {
+            let query_hash = dedup::simhash(&self.last_query);
+            self.causal_graph.record_trace(
+                self.current_turn,
+                query_hash,
+                &self.prev_selected_ids,
+                &self.prev_explored_ids,
+                advantage,
+            );
         }
         self.apply_prism_rl_update(&fragment_ids, advantage);
     }
@@ -2196,6 +2348,8 @@ impl EntrolyEngine {
             // Consolidation persistence
             total_consolidations: self.total_consolidations,
             consolidation_tokens_saved: self.consolidation_tokens_saved,
+            // Causal Context Graph persistence
+            causal_graph: &self.causal_graph,
         };
         serde_json::to_string(&state).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Serialization failed: {}", e))
@@ -2266,6 +2420,10 @@ impl EntrolyEngine {
         // Consolidation stats
         self.total_consolidations = state.total_consolidations;
         self.consolidation_tokens_saved = state.consolidation_tokens_saved;
+        // Causal Context Graph warm-start
+        if let Some(cg) = state.causal_graph {
+            self.causal_graph = cg;
+        }
         Ok(())
     }
 
@@ -2776,6 +2934,8 @@ struct EngineState<'a> {
     // ── Consolidation persistence ──
     total_consolidations: u64,
     consolidation_tokens_saved: u64,
+    // ── Causal Context Graph persistence ──
+    causal_graph: &'a CausalContextGraph,
 }
 
 /// Owned state for deserialization.
@@ -2823,6 +2983,9 @@ struct OwnedEngineState {
     total_consolidations: u64,
     #[serde(default)]
     consolidation_tokens_saved: u64,
+    // ── Causal Context Graph (optional for backward-compat) ──
+    #[serde(default)]
+    causal_graph: Option<CausalContextGraph>,
 }
 
 fn default_max_fragments() -> usize { 10_000 }
@@ -3331,6 +3494,7 @@ mod tests {
             w_resonance: 0.0,
             total_consolidations: 0,
             consolidation_tokens_saved: 0,
+            causal_graph: &CausalContextGraph::new(),
         };
 
         let json = serde_json::to_string(&state).expect("failed to serialize OwnedEngineState to JSON");
