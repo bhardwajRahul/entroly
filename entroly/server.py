@@ -40,6 +40,7 @@ from .checkpoint import CheckpointManager, ContextFragment
 from .query_refiner import QueryRefiner
 from .adaptive_pruner import EntrolyPruner, FragmentGuard
 from .provenance import build_provenance, ContextProvenance
+from .autotune import FeedbackJournal, TaskProfileOptimizer
 from .multimodal import ingest_image as _mm_image, ingest_diagram as _mm_diagram
 from .multimodal import ingest_voice as _mm_voice, ingest_diff as _mm_diff
 from .proxy_transform import calibrated_token_count as _calibrated_token_count
@@ -1124,6 +1125,13 @@ def create_mcp_server():
     )
     engine = EntrolyEngine(config=_config)
 
+    # Cross-session feedback journal + task-conditioned profiles
+    _checkpoint_dir = os.environ.get("ENTROLY_DIR", os.path.join(os.getcwd(), ".entroly"))
+    _feedback_journal = FeedbackJournal(_checkpoint_dir)
+    _task_profiles = TaskProfileOptimizer(_feedback_journal)
+    _task_profiles.optimize_all()  # warm from existing journal
+    _last_opt_ctx = {}  # tracks last optimization for feedback attribution
+
     @mcp.tool()
     def remember_fragment(
         content: str,
@@ -1178,9 +1186,28 @@ def create_mcp_server():
             token_budget: Maximum tokens allowed (default: 128K)
             query: Current query/task for semantic relevance scoring (can be vague)
         """
+        nonlocal _last_opt_ctx
         engine._turn_counter += 1
         engine.advance_turn()  # One turn per optimization request
+
+        # Apply task-conditioned weights before optimization
+        task_type, task_confidence = _task_profiles.apply_to_engine(engine, query)
+
         result = engine.optimize_context(token_budget, query)
+
+        # Capture optimization context for feedback attribution
+        _last_opt_ctx = {
+            "weights": {
+                "w_r": _config.weight_recency, "w_f": _config.weight_frequency,
+                "w_s": _config.weight_semantic_sim, "w_e": _config.weight_entropy,
+            },
+            "query": query, "token_budget": token_budget,
+            "selected_count": result.get("selected_count", 0),
+            "turn": engine._turn_counter,
+            "task_type": task_type,
+        }
+        result["_task_profile"] = {"task_type": task_type, "confidence": task_confidence}
+
         # Build ContextProvenance (hallucination_risk, source_set, per-fragment risk)
         provenance = build_provenance(
             optimize_result=result,
@@ -1231,6 +1258,21 @@ def create_mcp_server():
             engine.record_success(ids)
         else:
             engine.record_failure(ids)
+
+        # Log to cross-session feedback journal for autotune
+        if _last_opt_ctx:
+            _feedback_journal.log(
+                weights=_last_opt_ctx.get("weights", {}),
+                reward=1.0 if success else -1.0,
+                selected_count=_last_opt_ctx.get("selected_count", 0),
+                query=_last_opt_ctx.get("query", ""),
+                token_budget=_last_opt_ctx.get("token_budget", 0),
+                turn=_last_opt_ctx.get("turn", 0),
+            )
+            # Re-optimize task profiles periodically
+            if _feedback_journal.count() % 5 == 0:
+                _task_profiles.optimize_all()
+
         return json.dumps({
             "status": "recorded",
             "fragment_ids": ids,

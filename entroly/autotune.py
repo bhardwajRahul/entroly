@@ -480,3 +480,343 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CROSS-SESSION FEEDBACK JOURNAL + REWARD-WEIGHTED OPTIMIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These classes add the same capabilities as the JS autotune:
+#   1. FeedbackJournal: persistent .jsonl log of (weights, reward) episodes
+#   2. reward_weighted_optimize(): closed-form optimal weights from feedback
+#   3. TaskProfileOptimizer: per-task-type weight profiles
+#
+# The existing bench-based autotune above is untouched. These are additive.
+# ═══════════════════════════════════════════════════════════════════════════
+
+import math
+import re
+
+WEIGHT_KEYS = ["w_r", "w_f", "w_s", "w_e"]
+DECAY_GAMMA = 0.995
+WARMUP_EPISODES = 8
+MAX_BLEND_RATE = 0.5
+MIN_WEIGHT = 0.05
+MAX_WEIGHT = 0.80
+JOURNAL_MAX_AGE_S = 14 * 24 * 60 * 60  # 14 days
+
+
+class FeedbackJournal:
+    """Persistent cross-session feedback journal (.jsonl)."""
+
+    def __init__(self, journal_dir: str):
+        self.journal_dir = Path(journal_dir)
+        self.journal_dir.mkdir(parents=True, exist_ok=True)
+        self.journal_path = self.journal_dir / "feedback_journal.jsonl"
+        self._cache: Optional[list] = None
+
+    def log(self, *, weights: Dict[str, float], reward: float,
+            selected_count: int = 0, query: str = "",
+            selected_sources: Optional[List[str]] = None,
+            token_budget: int = 0, turn: int = 0) -> None:
+        """Log a feedback episode."""
+        entry = {
+            "t": time.time(),
+            "w": weights,
+            "n": selected_count,
+            "src": (selected_sources or [])[:15],
+            "q": query[:120],
+            "r": max(-1.0, min(1.0, reward)),
+            "turn": turn,
+            "bgt": token_budget,
+        }
+        try:
+            with open(self.journal_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+            self._cache = None
+        except Exception:
+            pass
+
+    def load(self, max_age: float = JOURNAL_MAX_AGE_S) -> List[Dict]:
+        """Load episodes filtered by max age."""
+        if self._cache is not None:
+            return self._cache
+        cutoff = time.time() - max_age
+        episodes = []
+        try:
+            with open(self.journal_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ep = json.loads(line)
+                        if ep and ep.get("t", 0) >= cutoff and ep.get("w"):
+                            episodes.append(ep)
+                    except Exception:
+                        pass
+        except FileNotFoundError:
+            pass
+        self._cache = episodes
+        return episodes
+
+    def prune(self, max_age: float = JOURNAL_MAX_AGE_S) -> None:
+        """Remove episodes older than max_age."""
+        self._cache = None
+        kept = self.load(max_age)
+        self._cache = None
+        try:
+            with open(self.journal_path, "w") as f:
+                for ep in kept:
+                    f.write(json.dumps(ep) + "\n")
+        except Exception:
+            pass
+
+    def count(self) -> int:
+        return len(self.load())
+
+    def stats(self) -> Dict[str, Any]:
+        eps = self.load()
+        if not eps:
+            return {"episodes": 0, "successes": 0, "failures": 0, "avg_reward": 0}
+        successes = sum(1 for e in eps if e["r"] > 0)
+        failures = sum(1 for e in eps if e["r"] < 0)
+        avg_reward = sum(e["r"] for e in eps) / len(eps)
+        return {
+            "episodes": len(eps),
+            "successes": successes,
+            "failures": failures,
+            "avg_reward": round(avg_reward, 3),
+        }
+
+
+def _normalize_weights(w: Dict[str, float]) -> Dict[str, float]:
+    """Clamp and normalize weights to sum=1."""
+    out = {k: max(MIN_WEIGHT, min(MAX_WEIGHT, w.get(k, 0.25))) for k in WEIGHT_KEYS}
+    s = sum(out.values())
+    return {k: round(v / s, 4) for k, v in out.items()} if s > 0 else out
+
+
+def _extract_weights(w: Dict) -> Dict[str, float]:
+    return {
+        "w_r": w.get("w_r", w.get("R", 0.30)),
+        "w_f": w.get("w_f", w.get("F", 0.25)),
+        "w_s": w.get("w_s", w.get("S", 0.25)),
+        "w_e": w.get("w_e", w.get("E", 0.20)),
+    }
+
+
+def reward_weighted_optimize(
+    episodes: List[Dict],
+    current_weights: Dict[str, float],
+) -> Optional[Dict[str, Any]]:
+    """
+    Reward-weighted regression with:
+    - Global advantage normalization (REINFORCE++, 2025)
+    - Exponential decay (EXP3.S non-stationarity)
+    - Per-dimension adaptive step (CMA-ES LED, 2024)
+    - Fisher information natural gradient
+    - Polyak-Ruppert averaging
+    """
+    if len(episodes) < 3:
+        return None
+
+    rewards = [e["r"] for e in episodes]
+    mu = sum(rewards) / len(rewards)
+    sigma = math.sqrt(sum((r - mu) ** 2 for r in rewards) / len(rewards))
+
+    # Edge case: all rewards identical → use raw reward signs
+    if sigma < 1e-6:
+        advantages = [1.0 if r > 0 else (-1.0 if r < 0 else 0.0) for r in rewards]
+    else:
+        advantages = [(r - mu) / (sigma + 1e-8) for r in rewards]
+
+    sorted_eps = sorted(episodes, key=lambda e: e.get("t", 0))
+    decay_weights = [DECAY_GAMMA ** (len(episodes) - 1 - i) for i in range(len(sorted_eps))]
+
+    attract = {k: 0.0 for k in WEIGHT_KEYS}
+    attract_sum = 0.0
+    repel = {k: 0.0 for k in WEIGHT_KEYS}
+    repel_sum = 0.0
+
+    for i, ep in enumerate(sorted_eps):
+        w = _extract_weights(ep["w"])
+        adv = advantages[episodes.index(ep)] if ep in episodes else 0
+        decay = decay_weights[i]
+
+        if adv > 0:
+            weight = decay * adv
+            for k in WEIGHT_KEYS:
+                attract[k] += weight * w[k]
+            attract_sum += weight
+        elif adv < 0:
+            weight = decay * abs(adv)
+            for k in WEIGHT_KEYS:
+                repel[k] += weight * w[k]
+            repel_sum += weight
+
+    if attract_sum <= 0:
+        return None
+
+    for k in WEIGHT_KEYS:
+        attract[k] /= attract_sum
+    if repel_sum > 0:
+        for k in WEIGHT_KEYS:
+            repel[k] /= repel_sum
+
+    # Per-dimension stats
+    dim_stats = {}
+    for k in WEIGHT_KEYS:
+        values = [_extract_weights(e["w"])[k] for e in sorted_eps]
+        mean = sum(values) / len(values)
+        std = math.sqrt(sum((v - mean) ** 2 for v in values) / len(values)) or 0.01
+        snr = abs(attract[k] - current_weights[k]) / std
+        dim_stats[k] = {"mean": mean, "std": std, "snr": snr}
+
+    N = len(episodes)
+    confidence = min(1.0, N / WARMUP_EPISODES)
+    base_alpha = confidence * MAX_BLEND_RATE
+
+    beta = 0.15 * min(1.0, repel_sum / attract_sum) if repel_sum > 0 else 0
+    optimal = {}
+    blended = {}
+
+    for k in WEIGHT_KEYS:
+        repel_delta = (repel[k] - current_weights[k]) if repel_sum > 0 else 0
+        optimal[k] = attract[k] - beta * repel_delta
+
+        nat_grad_scale = 1.0 / (dim_stats[k]["std"] ** 2 + 0.01)
+        sigmoid_snr = 1.0 / (1.0 + math.exp(-2 * (dim_stats[k]["snr"] - 0.5)))
+        alpha_k = base_alpha * sigmoid_snr
+
+        direction = (optimal[k] - current_weights[k]) * nat_grad_scale
+        clamped = max(-0.1, min(0.1, direction))
+        blended[k] = current_weights[k] + alpha_k * clamped
+
+    # Polyak average
+    polyak = {k: 0.0 for k in WEIGHT_KEYS}
+    for ep in sorted_eps:
+        w = _extract_weights(ep["w"])
+        for k in WEIGHT_KEYS:
+            polyak[k] += w[k]
+    for k in WEIGHT_KEYS:
+        polyak[k] /= len(sorted_eps)
+
+    # Regret
+    avg_positive = (
+        sum(e["r"] for e in episodes if e["r"] > 0) /
+        max(sum(1 for e in episodes if e["r"] > 0), 1)
+    )
+    estimated_regret = max(0, (avg_positive - mu) * N)
+
+    return {
+        "optimal": _normalize_weights(optimal),
+        "blended": _normalize_weights(blended),
+        "polyak": _normalize_weights(polyak),
+        "confidence": confidence,
+        "success_count": sum(1 for e in episodes if e["r"] > 0),
+        "failure_count": sum(1 for e in episodes if e["r"] < 0),
+        "total_episodes": N,
+        "estimated_regret": round(estimated_regret, 2),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TASK-CONDITIONED WEIGHT PROFILES (Novel)
+# ═══════════════════════════════════════════════════════════════════════════
+
+TASK_PATTERNS = {
+    "Debugging":     re.compile(r"\b(fix|bug|error|crash|issue|debug|broken|fail|wrong|exception)\b", re.I),
+    "Feature":       re.compile(r"\b(add|implement|create|build|feature|new|support|integrate|enable)\b", re.I),
+    "Refactoring":   re.compile(r"\b(refactor|clean|reorganize|simplify|extract|rename|move|split|merge)\b", re.I),
+    "Performance":   re.compile(r"\b(optimize|performance|slow|fast|speed|cache|memory|leak|bottleneck)\b", re.I),
+    "Testing":       re.compile(r"\b(test|spec|assert|expect|mock|stub|coverage|unit|integration|e2e)\b", re.I),
+    "Documentation": re.compile(r"\b(document|readme|comment|explain|describe|usage|api)\b", re.I),
+}
+
+TASK_PRIORS = {
+    "Debugging":     {"w_r": 0.35, "w_f": 0.15, "w_s": 0.35, "w_e": 0.15},
+    "Feature":       {"w_r": 0.20, "w_f": 0.25, "w_s": 0.25, "w_e": 0.30},
+    "Refactoring":   {"w_r": 0.15, "w_f": 0.35, "w_s": 0.20, "w_e": 0.30},
+    "Performance":   {"w_r": 0.25, "w_f": 0.30, "w_s": 0.25, "w_e": 0.20},
+    "Testing":       {"w_r": 0.30, "w_f": 0.20, "w_s": 0.30, "w_e": 0.20},
+    "Documentation": {"w_r": 0.20, "w_f": 0.20, "w_s": 0.30, "w_e": 0.30},
+    "General":       {"w_r": 0.30, "w_f": 0.25, "w_s": 0.25, "w_e": 0.20},
+}
+
+
+def classify_query(query: str) -> str:
+    """Classify a query into a task type."""
+    if not query:
+        return "General"
+    for task_type, pattern in TASK_PATTERNS.items():
+        if pattern.search(query):
+            return task_type
+    return "General"
+
+
+class TaskProfileOptimizer:
+    """Per-task-type weight optimization from feedback journal."""
+
+    def __init__(self, journal: FeedbackJournal):
+        self.journal = journal
+        self._profiles: Dict[str, Dict] = {}
+
+    def optimize_all(self) -> Dict[str, Dict]:
+        """Classify episodes by task type and optimize each independently."""
+        episodes = self.journal.load()
+        if len(episodes) < 3:
+            return {}
+
+        buckets: Dict[str, list] = {}
+        for ep in episodes:
+            task_type = classify_query(ep.get("q", ""))
+            buckets.setdefault(task_type, []).append(ep)
+
+        profiles = {}
+        for task_type, task_eps in buckets.items():
+            prior = TASK_PRIORS.get(task_type, TASK_PRIORS["General"])
+            if len(task_eps) >= 3:
+                result = reward_weighted_optimize(task_eps, prior)
+                if result:
+                    profiles[task_type] = {
+                        "weights": result["blended"],
+                        "confidence": result["confidence"],
+                        "episodes": len(task_eps),
+                    }
+            if task_type not in profiles:
+                profiles[task_type] = {
+                    "weights": dict(prior),
+                    "confidence": 0,
+                    "episodes": len(task_eps),
+                }
+
+        # Add unseen task types with priors
+        for task_type, prior in TASK_PRIORS.items():
+            if task_type not in profiles:
+                profiles[task_type] = {"weights": dict(prior), "confidence": 0, "episodes": 0}
+
+        self._profiles = profiles
+        return profiles
+
+    def get_profile_for_query(self, query: str) -> Tuple[Dict[str, float], str, float]:
+        """Get optimal weights for a query. Returns (weights, task_type, confidence)."""
+        task_type = classify_query(query)
+        profile = self._profiles.get(task_type)
+        if profile and profile["confidence"] > 0:
+            return profile["weights"], task_type, profile["confidence"]
+        prior = TASK_PRIORS.get(task_type, TASK_PRIORS["General"])
+        return prior, task_type, 0.0
+
+    def apply_to_engine(self, engine, query: str) -> Tuple[str, float]:
+        """Apply task-conditioned weights to an engine."""
+        weights, task_type, confidence = self.get_profile_for_query(query)
+        if hasattr(engine, "_use_rust") and engine._use_rust:
+            engine._rust.set_weights(
+                weights["w_r"], weights["w_f"], weights["w_s"], weights["w_e"]
+            )
+        elif hasattr(engine, "set_weights"):
+            engine.set_weights(
+                weights["w_r"], weights["w_f"], weights["w_s"], weights["w_e"]
+            )
+        return task_type, confidence
