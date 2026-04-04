@@ -98,6 +98,7 @@ These layers are **complementary.** Doc tools give you better docs. Memory gives
 ```bash
 pip install entroly[full]
 entroly go
+npm i entroly
 ```
 
 **That's it.** `entroly go` auto-detects your project, configures your IDE, picks the optimal quality preset, starts the proxy and dashboard — all in one command.
@@ -110,6 +111,8 @@ Then point your AI tool's API base URL to `http://localhost:9377/v1`.
 pip install entroly                # install
 entroly init                       # auto-detect IDE + generate config
 entroly proxy --quality balanced   # start the proxy
+Node:
+npm i entroly
 ```
 
 | AI Tool | Setup |
