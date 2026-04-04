@@ -1,0 +1,178 @@
+---
+claim_id: 18a33f4c0f57f20001497e00
+entity: cache
+status: inferred
+confidence: 0.75
+sources:
+  - cache.rs:47
+  - cache.rs:72
+  - cache.rs:90
+  - cache.rs:107
+  - cache.rs:118
+  - cache.rs:136
+  - cache.rs:146
+  - cache.rs:160
+  - cache.rs:206
+  - cache.rs:221
+last_checked: 2026-04-04T19:51:14Z
+derived_from:
+  - cogops_compiler
+  - sast
+---
+
+# Module: cache
+
+**Language:** rs
+**Lines of code:** 2967
+
+## Types
+- `pub struct CacheEntry` — A single cache entry storing an LLM response and its metadata.
+- `pub struct CostModel` — Hybrid cost model for cache utility estimation.  U(entry) = P(hit) × (recompute_tokens × cost_per_token + latency_ms) − size_penalty  This optimizes *real-world cost savings*, not abstract hit rate. D
+- `pub struct EntropySketch` — Streaming entropy sketch — O(1) moment-based Rényi H₂ approximation.  Maintains running Σpᵢ² without storing the full distribution. When a new score arrives, updates incrementally: Σp² = Σ((old_sᵢ/new
+- `pub struct FrequencySketch` — Count-Min Sketch for sub-linear frequency estimation.  4-row × 256-column sketch with 4 independent hash functions. Supports periodic halving for non-stationarity (aging).  Used for TinyLFU-style admi
+- `pub struct Helper`
+- `pub struct ShiftDetector` — Page's CUSUM (Cumulative Sum) change-point detector on hit-rate.  Monitors the running hit-rate EMA and detects sudden drops (negative shift) that indicate a distribution change. When triggered: 1. Ha
+- `pub struct TailStats` — Tracks per-query cost savings for tail-latency analysis.
+- `pub struct AdaptiveAlpha` — Adaptive Rényi order selector.  Learns optimal α via gradient descent on hit-rate: α ← α - η · ∂(miss_rate)/∂α  Heavy-skew workloads → α increases (focus on dominant fragments). Flat workloads → α dec
+- `pub struct ThompsonGate` — Thompson Sampling Admission Gate.  Instead of hard-thresholding H_α > τ, we sample from a Beta posterior: p_admit ~ Beta(α_succ + prior, β_fail + prior) ADMIT if H_α(context) · p_admit > 0.5  This nat
+- `pub struct LazyHeapEntry` — Heap entry for lazy greedy eviction (Minoux 1978).
+- `pub struct SubmodularEvictor` — Submodular diversity-based cache eviction with lazy greedy evaluation.  f(S) = Σ_{i∈S} utility(eᵢ) · diversity(eᵢ, S\{i}) where utility incorporates cost model and time decay.  Lazy evaluation (Minoux
+- `pub struct CausalInvalidator` — Causal invalidation with depth-weighted exponential decay.  w(e) ← w(e) · exp(-λ · overlap_ratio · (1/depth_factor))  Direct dependents (depth 1) decay hardest. Transitive dependents (depth 2+) decay 
+- `pub struct HitPredictor` — Lightweight linear model predicting P(hit | features).  Features: [context_entropy, fragment_count, query_length_norm, recompute_cost_norm] Updated via online SGD with learning rate decay.  This bridg
+- `pub enum CacheLookup` — Cache lookup result with provenance.
+- `pub struct EgscConfig`
+- `pub struct CacheSnapshot` — Serializable snapshot of the full EGSC cache state.  Captures all entries (sorted by value for predictive warming), all learned parameters, and all stats. Indices are rebuilt on import.  Reference: Pr
+- `pub struct EgscCache` — EGSC — Entropy-Gated Submodular Cache (benchmark-grade).
+- `pub struct CacheStats` — Diagnostic statistics.
+
+## Functions
+- `fn new(`
+- `fn new_with_budget(`
+- `fn wilson_score(&self) -> f64` — Wilson score lower bound (95% CI).
+- `fn record_feedback(&mut self, success: bool)`
+- `fn default() -> Self`
+- `pub fn for_model(model_name: &str) -> Self` — Auto-detect pricing from model name (case-insensitive substring match).  Covers: OpenAI, Anthropic, Google, DeepSeek, Meta, Mistral. Falls back to GPT-4o pricing ($0.000015/token) for unknown models. 
+- `pub fn utility(&self, p_hit: f64, response_tokens: u32, _entry_size_bytes: usize) -> f64` — Compute the expected utility of caching an entry.
+- `pub fn new() -> Self`
+- `pub fn add(&mut self, score: f64)` — Add a score to the sketch.
+- `pub fn approx_h2(&self) -> f64` — Approximate Rényi H₂ from the sketch.  H₂ = -log₂(Σ pᵢ²) where pᵢ = sᵢ/Σsⱼ = -log₂(Σ sᵢ² / (Σsⱼ)²) = log₂((Σsⱼ)²) - log₂(Σ sᵢ²) = 2·log₂(Σsⱼ) - log₂(Σ sᵢ²)
+- `pub fn reset(&mut self)` — Reset the sketch for a new context set.
+- `fn default() -> Self`
+- `fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>`
+- `fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>`
+- `pub fn new() -> Self`
+- `fn hashes(hash: u64) -> [usize; 4]` — Four independent hash functions via bit-mixing.
+- `pub fn increment(&mut self, hash: u64) -> u8` — Increment frequency for a hash. Returns new estimate.
+- `pub fn estimate(&self, hash: u64) -> u8` — Estimate frequency for a hash (minimum across rows).
+- `pub fn halve(&mut self)` — Halve all counters — aging mechanism for non-stationarity.
+- `pub fn reset(&mut self)` — Force a full reset (used on severe distribution shift).
+- `fn default() -> Self`
+- `pub fn new() -> Self`
+- `pub fn observe(&mut self, was_hit: bool) -> Option<bool>` — Observe a hit/miss event. Returns shift severity: None = no shift, Some(false) = mild shift (halve), Some(true) = severe (reset).
+- `pub fn current_hit_rate(&self) -> f64`
+- `fn default() -> Self`
+- `pub fn new() -> Self`
+- `pub fn record(&mut self, cost_saved: f64)`
+- `pub fn percentile(&mut self, p: f64) -> f64` — Compute percentile (0-100). Sorts lazily.
+- `fn default() -> Self`
+- `pub fn new() -> Self`
+- `pub fn observe(&mut self, was_hit: bool)` — Record a hit/miss and potentially adapt α.
+- `fn default() -> Self`
+- `pub fn new() -> Self`
+- `pub fn context_entropy_sketch(&mut self, fragment_entropies: &[(f64, u32)]) -> f64` — Compute context entropy using the streaming sketch.  Feeds fragment entropy scores into the sketch and returns H₂ approx.
+- `pub fn context_entropy_exact(fragment_entropies: &[(f64, u32)], alpha: f64) -> f64` — Exact context entropy for small contexts (< 20 fragments).
+- `pub fn should_admit(` — Thompson sampling admission decision.  Returns (admit: bool, context_entropy: f64).
+- `pub fn observe_outcome(&mut self, was_hit: bool)` — Update posterior after observing whether an admitted entry was hit.
+- `pub fn admission_rate(&self) -> f64`
+- `fn default() -> Self`
+- `fn eq(&self, other: &Self) -> bool`
+- `fn partial_cmp(&self, other: &Self) -> Option<Ordering>`
+- `fn cmp(&self, other: &Self) -> Ordering`
+- `fn simhash_similarity(fp_a: u64, fp_b: u64) -> f64`
+- `fn entry_value(` —  Primary signals (determine if entry is worth keeping): - frequency: log(1 + hit_count) — hot items survive - recency: exp(-γ·age) — recently accessed items survive - cost: recompute_cost — expensive 
+- `pub fn select_victim_lazy(` — Lazy greedy victim selection (Minoux 1978).  Returns the hash of the entry with LOWEST value to evict.
+- `pub fn select_victim(entries: &[&CacheEntry], cost_model: &CostModel, current_turn: u32) -> Option<usize>` — Simple O(n²) victim selection (fallback for small caches). Returns index of the entry with LOWEST value.
+- `pub fn decay_multiplier_weighted(` — Depth-weighted decay multiplier.  `depth_weights` maps fragment_id → depth from change source. Depth 1 (direct dep) → full λ. Depth d → λ/d.
+- `pub fn invalidate_weighted(` — Apply depth-weighted invalidation with cascade tracking.  **Semantics**: Score downgrade, NOT silent stale reuse. Entries degraded below 0.15 are GC'd on next `advance_turn()`. Direct fragments (depth
+- `pub fn new() -> Self`
+- `pub fn predict(&self, features: &[f64; 4]) -> f64` — Predict P(hit) given features. Output clamped to [0.01, 0.99].
+- `pub fn features(context_entropy: f64, n_fragments: usize, query_len: usize, response_tokens: u32) -> [f64; 4]` — Extract features from a cache context.
+- `pub fn update(&mut self, features: &[f64; 4], was_hit: bool)` — Online SGD update after observing hit/miss.
+- `fn default() -> Self`
+- `fn default() -> Self`
+- `pub fn new(config: EgscConfig) -> Self`
+- `fn exact_hash(query: &str, fragment_ids: &HashSet<String>) -> u64`
+- `fn exact_hash_with_budget(query: &str, fragment_ids: &HashSet<String>, effective_budget: u32) -> u64`
+- `fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64`
+- `fn get_threshold(&self, query_simhash: u64) -> u32`
+- `fn adapt_threshold(&mut self, query_simhash: u64, was_good_match: bool)`
+- `pub fn lookup(&mut self, query: &str, fragment_ids: &HashSet<String>) -> CacheLookup` — Dual-layer lookup: exact hash → SimHash LSH.
+- `pub fn lookup_with_budget(&mut self, query: &str, fragment_ids: &HashSet<String>, effective_budget: u32) -> CacheLookup` — Budget-aware lookup used by the engine so cached selections do not leak across budgets.
+- `pub fn store(` — Store with TinyLFU frequency-gated admission + Thompson sampling.
+- `pub fn store_with_budget(` — Budget-aware store used by the engine so exact hits respect the budget that produced them.
+- `fn find_victim(&self) -> Option<u64>` — Find victim for eviction (lowest-value entry).
+- `fn evict_one(&mut self)`
+- `pub fn record_feedback(&mut self, query: &str, fragment_ids: &HashSet<String>, success: bool)`
+- `pub fn record_feedback_with_budget(&mut self, query: &str, fragment_ids: &HashSet<String>, effective_budget: u32, success: bool)`
+- `pub fn invalidate_weighted(&mut self, stale_closure: &HashSet<String>, depth_weights: &HashMap<String, u32>) -> u32` — Depth-weighted invalidation via DAG traversal.  **Semantics**: Score downgrade, NOT silent stale reuse. `quality_score *= exp(-λ · overlap · (1/depth))` for each affected entry. Entries degraded below
+- `pub fn gc(&mut self, min_quality: f64) -> u32`
+- `pub fn clear(&mut self)`
+- `pub fn stats(&mut self) -> CacheStats`
+- `pub fn len(&self) -> usize`
+- `pub fn is_empty(&self) -> bool`
+- `pub fn set_cost_per_token(&mut self, cost: f64)` — Set the cost-per-token for accurate TailStats cost reporting.
+- `pub fn export_cache(&self) -> Result<String, String>` — Export the cache state as a JSON string for checkpoint/restore.  Serializes all entries and learned parameters. Indices (exact_index, semantic_index) are NOT serialized — they are rebuilt from entries
+- `pub fn import_cache(&mut self, json_str: &str) -> Result<usize, String>` — Import cache state from a JSON snapshot string.  Rebuilds all indices from the deserialized entries. Learned parameters (Thompson gate, hit predictor, frequency sketch, shift detector, adaptive thresh
+- `fn default() -> Self`
+- `fn fids(ids: &[&str]) -> HashSet<String>`
+- `fn flat_depths(ids: &HashSet<String>) -> HashMap<String, u32>` — Helper: create flat depth weights (all depth 0) for testing.
+- `fn test_thompson_admits_high_entropy()`
+- `fn test_thompson_posterior_updates()`
+- `fn test_thompson_posterior_decay()`
+- `fn test_adaptive_alpha_starts_at_2()`
+- `fn test_adaptive_alpha_adapts()`
+- `fn test_sketch_empty()`
+- `fn test_sketch_single_item()`
+- `fn test_sketch_uniform_vs_skewed()`
+- `fn test_sketch_matches_exact()`
+- `fn test_cost_model_expensive_better()`
+- `fn test_cost_model_high_hit_prob_better()`
+- `fn test_predictor_learns()`
+- `fn test_submodular_evicts_redundant()`
+- `fn test_submodular_lazy_finds_victim()`
+- `fn test_causal_decay_full_overlap()`
+- `fn test_causal_decay_partial()`
+- `fn test_causal_decay_no_overlap()`
+- `fn test_depth_weighted_decay()`
+- `fn test_cascade_tracking()`
+- `fn test_exact_hit()`
+- `fn test_semantic_hit()`
+- `fn test_thompson_rejects_trivial()`
+- `fn test_eviction_on_full_cache()`
+- `fn test_invalidation_integration()`
+- `fn test_wilson_score_converges()`
+- `fn test_gc_removes_low_quality()`
+- `fn test_cache_persistence_roundtrip()`
+- `fn test_warm_start_hit_rate()`
+- `fn test_stats_comprehensive()`
+- `fn test_renyi_h2_leq_shannon()`
+- `fn test_renyi_monotone_in_alpha()`
+- `fn test_renyi_uniform_equals_log_n()`
+- `fn test_submodular_diminishing_returns()`
+- `fn test_causal_decay_monotone_in_overlap()`
+- `fn zipf_sequence(n: usize, n_unique: usize, alpha: f64, seed: u64) -> Vec<usize>` — Generate a Zipfian query sequence: P(query=i) ∝ 1/(i+1)^alpha.
+- `fn run_egsc_workload(queries: &[usize], cache_size: usize) -> (u64, u64)` — Run a workload through EGSC, returns (hits, total).
+- `fn run_lru_workload(queries: &[usize], cache_size: usize) -> (u64, u64)` — Run LRU baseline, returns (hits, total).
+- `fn run_lfu_workload(queries: &[usize], cache_size: usize) -> (u64, u64)` — Run LFU baseline, returns (hits, total).
+- `fn test_bench_multi_workload_hit_rate()`
+- `fn run_tinylfu_cost(queries: &[usize], costs: &[u32], cache_size: usize) -> f64` — TinyLFU baseline (strongest known): frequency-gated LRU.
+- `fn test_bench_cost_aware_utility()`
+- `fn test_bench_prediction_accuracy()`
+- `fn test_bench_dag_aware_eviction()`
+- `fn test_bench_adaptivity()`
+- `fn test_bench_throughput()`
+- `fn test_bench_baseline_gauntlet()`
+- `fn test_bench_mutation_stress()`
+- `fn test_bench_distribution_shift_torture()`
+- `fn test_bench_ablation_study()`
+- `fn test_bench_scale_invariance()`
