@@ -455,15 +455,18 @@ class EntrolyEngine:
         self._index_path = str(Path(self.config.checkpoint_dir) / "index.json.gz")
         if self._use_rust:
             try:
-                if hasattr(self._rust, 'load_index'):
-                    loaded = self._rust.load_index(self._index_path)
-                    if loaded:
-                        n = self._rust.fragment_count()
-                        logger.info(f"Loaded persistent index: {n} fragments from {self._index_path}")
-                    else:
-                        logger.info("No persistent index found, starting fresh session")
+                loaded = self._rust.load_index(self._index_path)
+                if loaded:
+                    n = self._rust.fragment_count()
+                    logger.info(f"Loaded persistent index: {n} fragments from {self._index_path}")
                 else:
-                    logger.debug("Rust engine does not support load_index -- skipping persistent index")
+                    logger.info("No persistent index found, starting fresh session")
+            except AttributeError:
+                # PyO3 EntrolyEngine may not expose load_index in this build
+                logger.debug("Rust engine does not support load_index -- skipping persistent index")
+            except (OSError, IOError):
+                # Index file doesn't exist yet — normal on first run
+                logger.info("No persistent index found, starting fresh session")
             except Exception as e:
                 logger.warning(f"Failed to load persistent index: {e}")
 
@@ -2372,6 +2375,10 @@ def _start_autotune_daemon(engine: "EntrolyEngine") -> None:
                 try:
                     run_autotune(iterations=10, bench_only=False)
                     _hot_reload_weights()
+                except FileNotFoundError:
+                    # bench/cases.json vanished (e.g. pip install mode) — stop silently
+                    logger.debug("Autotune: bench/cases.json not found, stopping benchmark loop")
+                    return
                 except Exception as e:
                     logger.warning(f"Autotune round failed: {e}")
                 time.sleep(30)  # 30s cooldown between rounds

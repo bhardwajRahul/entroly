@@ -84,7 +84,12 @@ class BenchResult:
 
 
 def load_cases() -> List[Dict[str, Any]]:
-    """Load the fixed benchmark cases (read-only val set)."""
+    """Load the fixed benchmark cases (read-only val set).
+
+    Returns empty list if the file doesn't exist (pip-install mode).
+    """
+    if not CASES_PATH.exists():
+        return []
     with open(CASES_PATH) as f:
         return json.load(f)
 
@@ -357,6 +362,9 @@ def run_autotune(iterations: int = 100,
       7. Repeat
     """
     cases = load_cases()
+    if not cases:
+        _log("Entroly Autotune -- no benchmark cases found (pip-install mode), skipping")
+        return
     config = load_config()
 
     _log(f"Entroly Autotune -- {len(cases)} benchmark cases loaded")
