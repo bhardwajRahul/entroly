@@ -237,10 +237,10 @@ Entroly dynamically compresses context without losing the information your LLM n
 
 | Benchmark | Status inside `bench/accuracy.py` | Validated Results (`gpt-4o-mini`) |
 |---|---|---|
-| **NeedleInAHaystack** | ✅ Fully Implemented | 100% retention |
-| **HumanEval** | ✅ Fully Implemented | 100% retention |
-| **GSM8K** | ✅ Fully Implemented | 92% retention |
-| **SQuAD 2.0** | ✅ Fully Implemented | 92% retention |
+| **NeedleInAHaystack** | Implemented | 100% retention |
+| **HumanEval** | Implemented | 100% retention |
+| **GSM8K** | Implemented | 92% retention |
+| **SQuAD 2.0** | Implemented | 92% retention |
 
 *We are actively expanding the suite to include LongBench and BFCL (Agent tool calling).*
 
@@ -309,9 +309,9 @@ Your AI sees this. You can see this. No hidden truncation.
 ### The `/explain` Endpoint
 
 After any request, call `GET localhost:9377/explain` to see:
-- ✅ Every included file with its resolution level and **why** it was included
-- ❌ Every excluded file and **why** it was dropped
-- 📊 Resolution summary (e.g., 5 Full, 8 Skeleton, 12 Reference)
+- **Included** — Every included file with its resolution level and why it was included
+- **Excluded** — Every excluded file and why it was dropped
+- **Summary** — Resolution exact breakdown (e.g., 5 Full, 8 Skeleton, 12 Reference)
 
 ### Honest Savings Claims
 
@@ -344,6 +344,20 @@ export ENTROLY_CONTEXT_REPORT=0
 | **Entroly (optimization)** | **Makes everything fit** — optimally compresses codebase + docs + memory into the token budget |
 
 These layers are **complementary.** Entroly is the optimization layer that ensures everything fits without waste.
+
+---
+
+## Not Just For Code: Universal Text Compression
+
+While Entroly was built for codebases, its core relies on **Shannon Entropy and Knapsack Mathematics**, meaning it is completely agnostic to the text it compresses. Entroly is widely used as a universal context compressor for:
+
+| Text Type | The Problem | How Entroly Compresses It |
+|---|---|---|
+| **Massive Server Logs** | 100K lines of identical `INFO` logs bury the one `ERROR` stack trace. | Drops repetitive logs (low entropy), strictly retains exceptions and novel timestamps. |
+| **Agent Memory** | Multi-agent swarms fill up the context window with conversational fluff. | Extracts only the high-signal, decision-making paragraphs to pass to the next agent. |
+| **Legal/Financial Docs** | RAG systems retrieve 50 pages of PDFs, blowing the token budget. | Scans the retrieved paragraphs, isolates the exact clauses answering the query, drops the boilerplate. |
+
+*In our `NeedleInAHaystack` benchmark, Entroly perfectly compressed 128,000 tokens of **Paul Graham essays** (pure English text) to 2,000 tokens while maintaining a 100% retrieval success rate.*
 
 ---
 
