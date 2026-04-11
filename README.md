@@ -242,8 +242,6 @@ Entroly dynamically compresses context without losing the information your LLM n
 | **GSM8K** | Implemented | 92% retention |
 | **SQuAD 2.0** | Implemented | 92% retention |
 
-*We are actively expanding the suite to include LongBench and BFCL (Agent tool calling).*
-
 ### Reproduce These Results
 
 ```bash
