@@ -1249,6 +1249,52 @@ def create_mcp_server():
         # Apply task-conditioned weights before optimization
         task_type, task_confidence = _task_profiles.apply_to_engine(engine, query)
 
+        # ── Auto-execute promoted skills that match the query ──────
+        # Closes the evolution loop: daemon creates skills → skills
+        # inject context into optimization → better results → RL learns
+        if query:
+            try:
+                promoted = [
+                    s for s in _py_skill_engine.list_skills()
+                    if s.get("status") == "promoted"
+                ]
+                if promoted:
+                    import re as _skill_re
+                    from entroly.skill_engine import SandboxedRunner
+                    runner = SandboxedRunner(timeout_seconds=5.0)
+                    query_lower = query.lower()
+                    for sk in promoted:
+                        try:
+                            # Fast entity match — skip subprocess if query
+                            # doesn't mention the skill's entity at all
+                            entity = sk.get("entity", "")
+                            if entity and entity.lower() not in query_lower:
+                                # Also check bare name (e.g. "auth" from "auth.py")
+                                bare = entity.split(".")[-1].split("/")[-1].lower()
+                                if bare not in query_lower:
+                                    continue
+
+                            spec = _py_skill_engine._load_skill(sk["skill_id"])
+                            if not spec or not spec.tool_code:
+                                continue
+
+                            run = runner.run_tool(spec.tool_code, query)
+                            if run.get("status") == "success" and isinstance(run.get("result"), dict):
+                                skill_results = run["result"].get("results", [])
+                                for sr in skill_results[:5]:
+                                    snippet = sr.get("snippet", "")
+                                    if snippet:
+                                        engine.remember_fragment(
+                                            content=snippet,
+                                            source=f"skill:{sk['skill_id']}:{sr.get('file', '')}",
+                                            token_count=0,
+                                            is_pinned=False,
+                                        )
+                        except Exception:
+                            pass  # Never block optimization for skill errors
+            except Exception:
+                pass
+
         result = engine.optimize_context(token_budget, query)
 
         # ── Record savings to ValueTracker (funds evolution budget) ──
@@ -1276,6 +1322,22 @@ def create_mcp_server():
             "task_type": task_type,
         }
         result["_task_profile"] = {"task_type": task_type, "confidence": task_confidence}
+
+        # ── Feed evolution loop on low sufficiency ─────────────────
+        # If the optimizer couldn't find good context, record a miss
+        # so the EvolutionDaemon can synthesize skills to fill the gap
+        sufficiency = result.get("sufficiency", 1.0)
+        if sufficiency < 0.5 and query:
+            try:
+                _py_evolution.record_miss(
+                    query=query,
+                    entity_key=query.split()[-1] if query.strip() else "unknown",
+                    intent=task_type or "unknown",
+                    flow_attempted="optimize_context",
+                    reason=f"low sufficiency ({sufficiency:.2f})",
+                )
+            except Exception:
+                pass  # Never fail optimization for evolution logging
 
         # Build ContextProvenance (hallucination_risk, source_set, per-fragment risk)
         provenance = build_provenance(
