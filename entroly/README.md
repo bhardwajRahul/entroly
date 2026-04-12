@@ -1,20 +1,35 @@
-# Entroly
+# Entroly 🤖🧠
 
-**Information-theoretic context optimization for AI coding agents.**
+**A self-evolving daemon that "dreams" about your codebase to cure AI hallucination.**
 
-Every AI coding tool manages context with dumb FIFO truncation — stuffing tokens until the window is full, then cutting from the top. Entroly applies mathematics to select the **optimal** context subset.
+Every AI coding tool manages context with dumb FIFO truncation — blindly stuffing tokens until the window is full, then chopping off the top. This causes your agents to hallucinate, loop endlessly, and burn API credits.
 
-```
+Entroly acts as an **Epistemic Firewall**. It sits locally on `localhost:9377` and intercepts traffic between your editor (Cursor, Claude Code, Copilot) and the LLM. 
+
+When you close your laptop, Entroly's background daemon wakes up. It crawls your repository, structurally induces the architecture, and pre-fetches answers. When you open your editor the next day, the agent responds instantly because Entroly already "dreamt" about the codebase all night and mathematically cached the exact tokens you need using a Rust backend.
+
+### 🚀 The 5-Second Quickstart
+
+**1. Install & Run**
+```bash
 pip install entroly
+entroly start
 ```
 
-## Architecture
+**2. Point your AI Agent**
+Change your AI tool's API base URL (in Cursor, Cline, or Claude Code) to:
+`http://localhost:9377/v1`
 
-Hybrid Rust + Python: CPU-intensive math (knapsack DP, entropy, SimHash, LSH, dependency graph) runs in Rust via PyO3 for 50-100x speedup. MCP protocol and orchestration run in Python via FastMCP. Pure Python fallbacks activate automatically if the Rust extension isn't available.
+**3. Watch the Magic**
+Open **`http://localhost:9378`** in your browser. Entroly comes with a gorgeous live intelligence dashboard. Watch the PRISM caching engine work in real-time, see which files are being excluded to prevent hallucination, and watch a live ticker of how much money you are saving.
 
-## What It Does
+---
 
-An MCP server that sits between your AI coding tool and the LLM, providing:
+## 🔬 Architecture (For the Nerds)
+
+Entroly isn't just a simple chunker; it uses heavy information-theory mathematics powered by a Hybrid Rust + Python backend (via PyO3 for a 50-100x speedup). 
+
+Instead of raw truncation, Entroly provides:
 
 | Engine | What it does | How it works |
 |--------|-------------|--------------|
@@ -31,7 +46,11 @@ An MCP server that sits between your AI coding tool and the LLM, providing:
 | **PRISM Optimizer** | Adapts scoring weights to the codebase | Anisotropic spectral optimization via Jacobi eigendecomposition on 4×4 covariance matrix |
 | **Provenance Chain** | Detects hallucination risk in selected context | Tracks source verification + confidence scoring per fragment |
 
-## Setup
+---
+
+## ⚙️ Advanced Setup: Direct MCP Server
+
+If you prefer not to use the local proxy interceptor, you can run Entroly as a standard MCP server.
 
 ### Cursor
 
