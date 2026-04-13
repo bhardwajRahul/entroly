@@ -286,7 +286,7 @@ Entroly is the first context engine with a **self-improving runtime** — it lea
 
 | Capability | What It Does | Cost |
 |---|---|---|
-| **PRISM Reinforcement Learning** | Learns which context produces good AI responses. Updates 4D scoring weights (recency, frequency, semantic, entropy) via policy gradients with counterfactual credit assignment. | Zero — runs on CPU |
+| **PRISM Reinforcement Learning** | Learns which context produces good AI responses. Updates 5D scoring weights (recency, frequency, semantic, entropy,resonance) via policy gradients with counterfactual credit assignment. | Zero — runs on CPU |
 | **Dreaming Loop** | During idle time (>60s inactivity), generates synthetic queries and runs self-play experiments to find better weight configurations. Monotonic improvement guarantee. | Zero — no API calls |
 | **Task-Conditioned Profiles** | Automatically detects task type (debugging, feature, refactor, performance, testing, docs) and loads task-specific learned weights. Debugging prioritizes recency; documentation prioritizes semantic similarity. | Zero |
 | **Skill Synthesis** | Identifies gaps in coverage, synthesizes new tools from AST analysis, benchmarks them, promotes winners, prunes losers. Full lifecycle — no human intervention. | Zero — structural analysis only |
