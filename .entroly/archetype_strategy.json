@@ -1,0 +1,32 @@
+{
+  "fullstack_monorepo": {
+    "weights": {
+      "w_recency": 0.3,
+      "w_frequency": 0.25,
+      "w_semantic": 0.25,
+      "w_entropy": 0.2,
+      "w_resonance": 0.1,
+      "decay_half_life": 20.0,
+      "min_relevance": 0.04,
+      "exploration_rate": 0.08
+    },
+    "sample_count": 0,
+    "confidence": 0.5,
+    "created_at": 1776481534.6845427,
+    "fingerprint": {
+      "lang_python": 0.3003412969283277,
+      "lang_rust": 0.18430034129692832,
+      "lang_js_ts": 0.09897610921501707,
+      "lang_other": 0.41638225255972694,
+      "avg_file_size": 0.7069971979612982,
+      "func_density": 0.3206179657088907,
+      "class_ratio": 0.20977596741344195,
+      "import_density": 0.3891793985521045,
+      "test_ratio": 0.10580204778156997,
+      "module_count": 0.6523558257806837,
+      "ffi_ratio": 0.023890784982935155,
+      "entropy_mean": 0.5064118099567281,
+      "entropy_var": 0.014306480327220098
+    }
+  }
+}

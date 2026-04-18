@@ -217,7 +217,7 @@ class TestWeightManagement:
 
         # Second session: should load persisted weights
         opt2 = ArchetypeOptimizer(data_dir=data_dir, project_root=tmp_project)
-        info2 = opt2.detect_and_load()
+        _info2 = opt2.detect_and_load()
         assert abs(opt2.current_weights()["w_recency"] - 0.99) < 0.001
 
     def test_different_projects_get_different_weights(self, tmp_path):

@@ -35,7 +35,7 @@ mod cognitive_bus;
 mod cache;
 mod resonance;
 mod causal;
-mod archetype;
+pub mod archetype;
 pub mod cogops;
 
 use pyo3::prelude::*;

@@ -7,10 +7,10 @@
 //! Mathematical grounding:
 //!   - The fingerprint is a d=16 dimensional vector F ∈ ℝ¹⁶ computed
 //!     from structural invariants of the codebase:
-//!       F = [lang_dist(4), struct_metrics(5), topology(4), entropy_stats(3)]
+//!     F = [lang_dist(4), struct_metrics(5), topology(4), entropy_stats(3)]
 //!
 //!   - Archetypes are discovered via online k-means clustering:
-//!       argmin_C Σᵢ ||Fᵢ - μ_c(i)||²
+//!     argmin_C Σᵢ ||Fᵢ - μ_c(i)||²
 //!     with adaptive k: clusters split when variance exceeds θ_split
 //!     and merge when centroids are within θ_merge.
 //!
@@ -30,6 +30,8 @@
 
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 /// Dimensionality of the fingerprint vector.
 pub const FINGERPRINT_DIM: usize = 16;
@@ -185,6 +187,7 @@ impl Archetype {
 /// Maintains an online k-means clustering of codebase fingerprints.
 /// Each cluster (archetype) has its own optimized weight profile
 /// that the DreamingLoop evolves independently.
+#[pyclass]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchetypeEngine {
     archetypes: Vec<Archetype>,
@@ -376,7 +379,7 @@ impl ArchetypeEngine {
 
         // Periodic maintenance: split/merge every 50 observations
         let total_samples: usize = self.archetypes.iter().map(|a| a.sample_count).sum();
-        if total_samples % 50 == 0 {
+        if total_samples.is_multiple_of(50) {
             self.maybe_split();
             self.maybe_merge();
         }
@@ -524,6 +527,83 @@ impl ArchetypeEngine {
             if self.archetypes.is_empty() { 0.0 }
             else { self.archetypes.iter().map(|a| a.confidence).sum::<f64>() / self.archetypes.len() as f64 });
         m
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PyO3 Bindings — Exposes ArchetypeEngine to Python
+// ═══════════════════════════════════════════════════════════════════
+
+#[pymethods]
+impl ArchetypeEngine {
+    /// Create a new ArchetypeEngine with 5 seed archetypes.
+    #[new]
+    pub fn py_new() -> Self {
+        ArchetypeEngine::new()
+    }
+
+    /// Fingerprint + classify a codebase from raw stats dict.
+    ///
+    /// Args:
+    ///   stats: dict with keys matching CodebaseStats fields
+    ///
+    /// Returns:
+    ///   dict with archetype_id, label, confidence, weights
+    pub fn classify_codebase(&self, py: Python<'_>, stats: &Bound<'_, PyDict>) -> PyResult<PyObject> {
+        let cs = CodebaseStats {
+            total_files: stats.get_item("total_files")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            python_files: stats.get_item("python_files")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            rust_files: stats.get_item("rust_files")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            js_ts_files: stats.get_item("js_ts_files")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            other_files: stats.get_item("other_files")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            total_lines: stats.get_item("total_lines")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            total_functions: stats.get_item("total_functions")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            total_classes: stats.get_item("total_classes")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            total_imports: stats.get_item("total_imports")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            test_files: stats.get_item("test_files")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            graph_nodes: stats.get_item("graph_nodes")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            graph_edges: stats.get_item("graph_edges")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            max_dep_depth: stats.get_item("max_dep_depth")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            module_count: stats.get_item("module_count")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+            entropy_values: stats.get_item("entropy_values")?
+                .and_then(|v| v.extract::<Vec<f64>>().ok())
+                .unwrap_or_default(),
+            ffi_files: stats.get_item("ffi_files")?.and_then(|v| v.extract().ok()).unwrap_or(0),
+        };
+
+        let fp = self.fingerprint(&cs);
+        let (arch_id, dist, confidence) = self.classify(&fp);
+        let weights = self.get_weights(arch_id);
+        let label = self.archetypes().iter()
+            .find(|a| a.id == arch_id)
+            .map(|a| a.label.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let result = PyDict::new(py);
+        result.set_item("archetype_id", arch_id)?;
+        result.set_item("label", &label)?;
+        result.set_item("confidence", confidence)?;
+        result.set_item("distance", dist)?;
+        result.set_item("w_recency", weights.w_recency)?;
+        result.set_item("w_frequency", weights.w_frequency)?;
+        result.set_item("w_semantic", weights.w_semantic)?;
+        result.set_item("w_entropy", weights.w_entropy)?;
+        result.set_item("decay_half_life", weights.decay_half_life)?;
+        result.set_item("min_relevance", weights.min_relevance)?;
+        result.set_item("exploration_rate", weights.exploration_rate)?;
+        Ok(result.into())
+    }
+
+    /// Get summary stats as a Python dict.
+    pub fn py_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let m = self.stats();
+        let result = PyDict::new(py);
+        for (k, v) in &m {
+            result.set_item(k, v)?;
+        }
+        result.set_item("archetype_labels",
+            self.archetypes().iter().map(|a| a.label.clone()).collect::<Vec<_>>())?;
+        Ok(result.into())
     }
 }
 
