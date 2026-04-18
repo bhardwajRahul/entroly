@@ -81,8 +81,8 @@ Abres tu laptop → tu IA ya absorbió todo
 
 Esto no es teórico. Está en producción. Ahora mismo.
 
-**Por qué nadie puede copiarlo:**
-- La red **es** el producto. Cada nuevo usuario mejora la IA de todos
+**El código es MIT. El foso es la red:**
+- Cada nuevo usuario mejora la IA de todos — esa base instalada no se puede forkear
 - Costo de infraestructura: **$0**. Funciona en GitHub. Sin servidores. Sin GPUs. Sin nube
 
 ```bash

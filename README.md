@@ -134,9 +134,8 @@ You open your laptop → your AI already absorbed all of it
 
 This is not theoretical. It's shipping. Right now.
 
-**Why no one can copy this:**
-- The network **is** the product. Every new user makes everyone else's AI better
-- Competitors would need to build the same installed base from scratch
+**The code is MIT. The moat is the network:**
+- Every new user makes everyone else's AI better — that installed base can't be forked
 - Your code never moves. Only optimization weights — noise-protected and anonymous
 - Infrastructure cost: **$0**. It runs on GitHub. No servers. No GPUs. No cloud
 

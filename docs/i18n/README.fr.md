@@ -81,8 +81,8 @@ Vous ouvrez votre laptop → votre IA a déjà tout absorbé
 
 Ce n'est pas théorique. C'est en production. Maintenant.
 
-**Pourquoi personne ne peut copier :**
-- Le réseau **est** le produit. Chaque nouvel utilisateur améliore l'IA de tous
+**Le code est MIT. Le fossé, c'est le réseau :**
+- Chaque nouvel utilisateur améliore l'IA de tous — cette base installée ne peut pas être forkée
 - Coût d'infrastructure : **0$**. Tourne sur GitHub. Pas de serveurs. Pas de GPUs. Pas de cloud
 
 ```bash

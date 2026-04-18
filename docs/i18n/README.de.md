@@ -81,8 +81,8 @@ Du öffnest deinen Laptop → deine KI hat bereits alles absorbiert
 
 Das ist nicht theoretisch. Es läuft. Jetzt gerade.
 
-**Warum das niemand kopieren kann:**
-- Das Netzwerk **ist** das Produkt. Jeder neue User macht die KI aller anderen besser
+**Der Code ist MIT. Der Burggraben ist das Netzwerk:**
+- Jeder neue User macht die KI aller anderen besser — diese Installationsbasis kann nicht geforkt werden
 - Infrastrukturkosten: **$0**. Läuft auf GitHub. Keine Server. Keine GPUs. Keine Cloud
 
 ```bash

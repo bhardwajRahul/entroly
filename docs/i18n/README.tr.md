@@ -81,8 +81,8 @@ Laptopunuzu açarsınız → AI'nız zaten hepsini emmiş
 
 Bu teorik değil. Üretimde çalışıyor. Şu anda.
 
-**Neden kimse kopyalayamaz:**
-- Ağ ürünün **kendisidir**. Her yeni kullanıcı herkesin AI'ını iyileştirir
+**Kod MIT. Hendek ağdır:**
+- Her yeni kullanıcı herkesin AI'ını iyileştirir — o kurulu tabanı forklayamazsınız
 - Altyapı maliyeti: **$0**. GitHub'da çalışır. Sunucu yok. GPU yok. Bulut yok
 
 ```bash
