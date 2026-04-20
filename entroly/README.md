@@ -283,10 +283,8 @@ EntrolyConfig(
 - ILRe (ICLR 2026) — Intermediate Layer Retrieval
 - Agentic Plan Caching (arXiv 2025)
 
-## Part of the Ebbiforge Ecosystem
 
-Entroly integrates with [hippocampus-sharp-memory](https://pypi.org/project/hippocampus-sharp-memory/) for persistent memory and [Ebbiforge](https://pypi.org/project/ebbiforge/) for TF embeddings and RL weight learning. Both are optional — Entroly works standalone with pure Python fallbacks.
 
 ## License
 
-MIT
+Apache-2.0

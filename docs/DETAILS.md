@@ -877,10 +877,6 @@ Hybrid Rust + Python. All math in Rust via PyO3 (50-100x faster). MCP + orchestr
 
 ---
 
-## Part of the Ebbiforge Ecosystem
-
-Integrates with [hippocampus-sharp-memory](https://pypi.org/project/hippocampus-sharp-memory/) for persistent cross-session memory and [Ebbiforge](https://pypi.org/project/ebbiforge/) for embeddings + RL weight learning. Both optional.
-
 ---
 
 ## License
