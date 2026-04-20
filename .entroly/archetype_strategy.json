@@ -10,8 +10,8 @@
       "min_relevance": 0.04,
       "exploration_rate": 0.08
     },
-    "sample_count": 0,
-    "confidence": 0.5,
+    "sample_count": 40,
+    "confidence": 0.95,
     "created_at": 1776481534.6845427,
     "fingerprint": {
       "lang_python": 0.3003412969283277,
@@ -27,6 +27,7 @@
       "ffi_ratio": 0.023890784982935155,
       "entropy_mean": 0.5064118099567281,
       "entropy_var": 0.014306480327220098
-    }
+    },
+    "updated_at": 1776495451.6062102
   }
 }

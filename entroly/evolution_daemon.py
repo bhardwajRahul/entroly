@@ -218,6 +218,28 @@ class EvolutionDaemon:
         gaps = self._evo_logger.get_pending_gaps()
         now = time.time()
 
+        # ── PageRank prioritization: process hub-file gaps first ────
+        # Hub files (imported by many others) have higher structural ROI.
+        # A skill for a hub file benefits more downstream consumers.
+        pagerank_scores: dict[str, float] = {}
+        if gaps and self._structural._engine is not None:
+            try:
+                pagerank_scores = dict(self._structural._engine.compute_pagerank())
+            except Exception as e:
+                logger.debug("EvolutionDaemon: PageRank computation skipped: %s", e)
+
+        if pagerank_scores:
+            # Sort gaps by max PageRank score of their source files (descending)
+            def _gap_priority(gap: dict[str, Any]) -> float:
+                source_files = gap.get("source_files", [])
+                if not source_files:
+                    return 0.0
+                return max(
+                    (pagerank_scores.get(sf, 0.0) for sf in source_files),
+                    default=0.0,
+                )
+            gaps = sorted(gaps, key=_gap_priority, reverse=True)
+
         for gap in gaps:
             entity_key = gap["entity_key"]
 

@@ -2692,6 +2692,7 @@ def main():
     except Exception as e:
         logger.warning("Autotune: failed to start daemon: %s", e)
 
+
     # Multi-client support: SSE transport enables multiple IDE connections
     transport = os.environ.get("ENTROLY_MCP_TRANSPORT", "stdio")
     if "--sse" in sys.argv or transport == "sse":

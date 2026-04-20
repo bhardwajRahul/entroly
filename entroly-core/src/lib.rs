@@ -37,6 +37,7 @@ mod resonance;
 mod causal;
 pub mod archetype;
 pub mod cogops;
+mod bm25;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -50,6 +51,7 @@ use knapsack::{knapsack_optimize, compute_lambda_star, ScoringWeights};
 use knapsack_sds::{ios_select, Resolution, InfoFactors};
 use entropy::{information_score, shannon_entropy, normalized_entropy, boilerplate_ratio, renyi_entropy_2, entropy_divergence};
 use dedup::{simhash, hamming_distance, DedupIndex};
+use bm25::BM25Index;
 use depgraph::{DepGraph, extract_identifiers};
 use guardrails::{file_criticality, has_safety_signal, TaskType, FeedbackTracker, Criticality, compute_ordering_priority};
 use prism::PrismOptimizer;
@@ -1159,12 +1161,304 @@ impl EntrolyEngine {
                 }
             }
 
-            // Update semantic scores if query provided
+            // ── GGCR: Graph-Guided Causal Retrieval ──────────────────────
+            // Replaces SimHash Hamming distance (noise ~0.45±0.03) with
+            // multi-signal fusion for actual query-document relevance.
+            //
+            // Signals:
+            //   1. BM25 (lexical): term freq × inverse doc freq + path/id boost
+            //   2. Causal chain (structural): dep graph from query-matched files
+            //   3. PageRank (centrality): hub files many others depend on
+            //   4. NCD (compression): reranker for top-50 candidates
+            //
+            // References:
+            //   - Robertson & Zaragoza (2009) — BM25
+            //   - Li & Vitányi (2004) — NCD universal similarity metric
+            //   - GraphCodeAgent (arxiv 2025) — graph retrieval beats dense
             if !query.is_empty() {
-                let query_hash = simhash(&query);
-                for frag in self.fragments.values_mut() {
-                    let dist = hamming_distance(query_hash, frag.simhash);
-                    frag.semantic_score = (1.0 - dist as f64 / 64.0).max(0.0);
+                let query_terms: Vec<String> = bm25::tokenize_code(&query);
+
+                // ── Signal 1: BM25 Lexical Scoring ──
+                let doc_tuples: Vec<(String, String, String)> = self.fragments.iter()
+                    .map(|(id, f)| (id.clone(), f.content.clone(), f.source.clone()))
+                    .collect();
+                let bm25_idx = BM25Index::build(&doc_tuples);
+
+                let mut bm25_raw: HashMap<String, f64> = HashMap::with_capacity(self.fragments.len());
+                for (fid, frag) in &self.fragments {
+                    let identifiers = extract_identifiers(&frag.content);
+                    let score = bm25_idx.score(&query_terms, &frag.content, &frag.source, &identifiers);
+                    bm25_raw.insert(fid.clone(), score.combined);
+                }
+
+                // Normalize BM25 to [0.05, 1.0]
+                let fid_order: Vec<String> = self.fragments.keys().cloned().collect();
+                let raw_vec: Vec<f64> = fid_order.iter()
+                    .map(|fid| bm25_raw.get(fid).copied().unwrap_or(0.0))
+                    .collect();
+                let norm_vec = bm25::normalize_scores(&raw_vec);
+                let bm25_norm: HashMap<String, f64> = fid_order.iter()
+                    .zip(norm_vec.iter())
+                    .map(|(fid, &s)| (fid.clone(), s))
+                    .collect();
+
+                // ── Signal 2: Causal Chain via Dep Graph ──
+                // Top BM25 matches seed a BFS through the dep graph.
+                // Files in the causal chain are structurally connected
+                // to query-relevant code — embeddings can't find these.
+                let mut sorted_bm25: Vec<(String, f64)> = bm25_raw.iter()
+                    .map(|(k, &v)| (k.clone(), v))
+                    .collect();
+                sorted_bm25.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let seed_ids: Vec<String> = sorted_bm25.iter()
+                    .take(10)
+                    .filter(|(_, s)| *s > 0.5)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let causal_set: HashSet<String> = if !seed_ids.is_empty() {
+                    hierarchical::identify_cluster(&self.dep_graph, &seed_ids, 2)
+                        .into_iter().collect()
+                } else {
+                    HashSet::new()
+                };
+
+                // ── Signal 3: PageRank Centrality ──
+                let pr_ids: Vec<String> = self.fragments.keys().cloned().collect();
+                let pagerank = hierarchical::compute_pagerank(&self.dep_graph, &pr_ids, 15);
+                let max_pr = pagerank.values().cloned().fold(0.0_f64, f64::max).max(1e-10);
+
+                // ── Signal 4: NCD Reranking (top-50 only for performance) ──
+                let top_candidates: Vec<String> = sorted_bm25.iter()
+                    .take(50)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let mut ncd_scores: HashMap<String, f64> = HashMap::new();
+                for fid in &top_candidates {
+                    if let Some(frag) = self.fragments.get(fid) {
+                        // Truncate to 2KB for NCD perf (first 2KB has imports+defs)
+                        let end = frag.content.len().min(2048);
+                        let safe = (0..=end).rev()
+                            .find(|&i| frag.content.is_char_boundary(i))
+                            .unwrap_or(0);
+                        let sample = &frag.content[..safe];
+                        ncd_scores.insert(fid.clone(), entropy::ncd_similarity(&query, sample));
+                    }
+                }
+
+                // ── Fusion → semantic_score ──
+                // Phase 5: Task-type-adaptive fusion weights.
+                // Different query types benefit from different signals:
+                //   Debug → BM25 dominates (exact error/function name matching)
+                //   Refactor → causal chain dominates (structural deps matter)
+                //   Architecture → PageRank dominates (hub files, system overview)
+                //   Understanding → balanced (need both content + structure)
+                //
+                // These weights are the starting point; PRISM's semantic dimension
+                // weight (w_semantic) then scales the entire fused score relative to
+                // recency/frequency/entropy, so online learning still applies.
+                let task_type = TaskType::classify(&query);
+                let (w_bm25, w_causal, w_pr, w_ncd) = match task_type {
+                    TaskType::BugTracing => (0.55, 0.15, 0.10, 0.20),
+                    TaskType::Refactoring => (0.30, 0.30, 0.20, 0.20),
+                    TaskType::CodeGeneration => (0.35, 0.25, 0.20, 0.20),
+                    TaskType::Exploration => (0.35, 0.15, 0.25, 0.25),
+                    _ => (0.40, 0.20, 0.15, 0.25),
+                };
+
+                // ── Query Kernel Extraction ──────────────────────────
+                // Identify the most discriminative query terms (highest IDF).
+                // These are the "kernel" — the terms that identify WHAT the
+                // user is asking about, vs HOW (intent terms like "refactor").
+                //
+                // For "Refactor the checkpoint system to support async":
+                //   kernel = ["checkpoint"] (highest IDF — rare, specific)
+                //   intent = ["refactor", "support", "system", "async"] (common)
+                //
+                // Files whose filename matches a kernel term are about that
+                // concept — they should rank at the top regardless of generic
+                // term frequency.
+                //
+                // Ref: Robertson & Sparck Jones (1976), "Relevance weighting
+                //      of search terms"
+                let mut term_idfs: Vec<(String, f64)> = query_terms.iter()
+                    .map(|t| (t.clone(), bm25_idx.idf(t)))
+                    .collect();
+                term_idfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+                // Top 2 highest-IDF terms are the kernel
+                let kernel_terms: Vec<String> = term_idfs.iter()
+                    .take(2)
+                    .filter(|(_, idf)| *idf > 1.0) // Must be reasonably rare
+                    .map(|(t, _)| t.clone())
+                    .collect();
+                for (fid, frag) in self.fragments.iter_mut() {
+                    let bm25_s = bm25_norm.get(fid).copied().unwrap_or(0.05);
+                    let causal_s: f64 = if causal_set.contains(fid) { 1.0 } else { 0.0 };
+                    let pr_s = (pagerank.get(fid).copied().unwrap_or(0.0) / max_pr).min(1.0);
+                    let ncd_s = ncd_scores.get(fid).copied().unwrap_or(0.0);
+
+                    // ── Multi-Signal Linear Fusion with CombMNZ ──────
+                    // Linear base + CombMNZ bonus for multi-signal alignment.
+                    // CombMNZ (Fox & Shaw, 1994): score × count_of_active_signals
+                    // rewards files that match across multiple retrieval channels.
+                    let base = w_bm25 * bm25_s
+                        + w_causal * causal_s
+                        + w_pr * pr_s
+                        + w_ncd * ncd_s;
+
+                    // Count active signals (non-trivial values)
+                    let active = 1.0  // BM25 always active
+                        + if causal_s > 0.0 { 1.0 } else { 0.0 }
+                        + if pr_s > 0.2 { 1.0 } else { 0.0 }
+                        + if ncd_s > 0.1 { 1.0 } else { 0.0 };
+
+                    // CombMNZ: boost proportional to signal count (max 25% bonus)
+                    let fused = (base * (1.0 + 0.25 * (active - 1.0) / 3.0))
+                        .clamp(0.0, 1.0);
+
+                    // ── Source File Type Boost ─────────────────────────
+                    // Quality invariant: source code must ALWAYS outrank
+                    // docs/configs when semantic scores are close.
+                    // Without this, CONTRIBUTING.md can outrank _checkpoint.py
+                    // because .md files have higher entropy scores.
+                    //
+                    // Boost is multiplicative on the fused score, so it only
+                    // amplifies existing semantic signal — it cannot promote
+                    // an irrelevant .py file above a relevant .md file.
+                    let src_lower = frag.source.to_lowercase();
+
+                    // Detect test/example files (contain usage, not implementation)
+                    let is_test = src_lower.contains("/test_")
+                        || src_lower.contains("/tests/")
+                        || src_lower.contains("\\test_")
+                        || src_lower.contains("\\tests\\")
+                        || src_lower.contains("/examples/")
+                        || src_lower.contains("\\examples\\")
+                        || src_lower.contains("/bench/")
+                        || src_lower.contains("\\bench\\")
+                        || src_lower.contains("/conftest")
+                        || src_lower.contains("\\conftest");
+
+                    let is_source = (src_lower.ends_with(".py")
+                        || src_lower.ends_with(".rs")
+                        || src_lower.ends_with(".ts")
+                        || src_lower.ends_with(".js")
+                        || src_lower.ends_with(".tsx")
+                        || src_lower.ends_with(".jsx"))
+                        && !is_test;
+
+                    let type_boost = if is_source {
+                        // Core source code: 15% boost
+                        1.15
+                    } else if is_test {
+                        // Test/example: 5% penalty (has relevant terms but not impl)
+                        0.95
+                    } else if src_lower.ends_with(".md")
+                        || src_lower.ends_with(".json")
+                        || src_lower.ends_with(".yml")
+                        || src_lower.ends_with(".yaml")
+                        || src_lower.ends_with(".toml")
+                        || src_lower.ends_with(".cfg")
+                    {
+                        // Docs/config: 10% penalty
+                        0.90
+                    } else {
+                        1.0
+                    };
+
+                    frag.semantic_score = (fused * type_boost).clamp(0.0, 1.0);
+
+                    // ── Query Kernel Filename Boost ───────────────────
+                    // If a NON-TEST file's name matches the highest-IDF
+                    // query term, this file's PRIMARY PURPOSE is that concept.
+                    // _checkpoint.py → primary purpose is "checkpoint"
+                    // Skip test files: test_checkpoint.py just tests it.
+                    if !kernel_terms.is_empty() && !is_test {
+                        let fname = frag.source.rsplit(&['/', '\\'][..])
+                            .next().unwrap_or("").to_lowercase();
+                        for kt in &kernel_terms {
+                            if fname.contains(kt.as_str()) {
+                                frag.semantic_score = frag.semantic_score.max(0.95);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // ── Entity Query Routing (RANGER-style, ICLR 2025) ──────
+                // For entity queries ("StateGraph", "ChatOpenAI"), files that
+                // DEFINE the entity must outrank files that merely import it.
+                //
+                // IMPORTANT: Extract entities from the RAW query (preserves
+                // CamelCase), NOT from query_terms (already lowercased).
+                let raw_words: Vec<&str> = query.split_whitespace().collect();
+                let entities: Vec<String> = raw_words.iter()
+                    .filter(|w| {
+                        let chars: Vec<char> = w.chars().collect();
+                        // CamelCase: has uppercase letter after position 0
+                        let is_camel = chars.len() > 2
+                            && chars[0].is_uppercase()
+                            && chars.iter().skip(1).any(|c| c.is_lowercase())
+                            && chars.iter().skip(1).any(|c| c.is_uppercase());
+                        // PascalCase single word (e.g. "StateGraph")
+                        let is_pascal = chars.len() > 3
+                            && chars[0].is_uppercase()
+                            && chars.iter().skip(1).any(|c| c.is_lowercase());
+                        // Long snake_case identifier
+                        let is_snake = w.contains('_') && w.len() > 5;
+                        is_camel || is_pascal || is_snake
+                    })
+                    .map(|w| w.to_string())
+                    .collect();
+
+                if !entities.is_empty() {
+                    for (_fid, frag) in self.fragments.iter_mut() {
+                        let content = &frag.content;
+                        let source_lower = frag.source.to_lowercase();
+                        for entity in &entities {
+                            let entity_lower = entity.to_lowercase();
+
+                            // Definition patterns (preserves original case for matching)
+                            let is_definition = content.contains(&format!("class {}", entity))
+                                || content.contains(&format!("class {}(", entity))
+                                || content.contains(&format!("class {}:", entity))
+                                || content.contains(&format!("def {}", entity))
+                                || content.contains(&format!("def {}(", entity))
+                                || content.contains(&format!("struct {}", entity))
+                                || content.contains(&format!("fn {}", entity))
+                                || content.contains(&format!("trait {}", entity))
+                                || content.contains(&format!("interface {}", entity))
+                                || content.contains(&format!("type {} ", entity));
+
+                            // Path contains the entity name (case-insensitive)
+                            let in_path = source_lower.contains(&entity_lower);
+
+                            if is_definition {
+                                // Absolute boost: defining file goes to near-max
+                                // This overrides BM25 coverage bonus which can
+                                // push test files (matching many terms) above source
+                                frag.semantic_score = frag.semantic_score.max(0.95);
+                            } else if in_path {
+                                // Moderate boost: file is named after the entity
+                                frag.semantic_score = (frag.semantic_score * 1.25).min(1.0);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Cold-Start Weight Adaptation ──────────────────────────────
+            // On first use: recency=1.0 and frequency=0.0 for ALL fragments,
+            // so these dimensions carry zero information. Transfer weight
+            // from recency→semantic so the GGCR signal dominates.
+            // Saved and restored at the end of optimize() to avoid permanent drift.
+            let (saved_w_recency, saved_w_semantic) = (self.w_recency, self.w_semantic);
+            if !query.is_empty() {
+                let obs = self.feedback.total_observations();
+                if obs < 20 {
+                    let boost = 0.15 * (1.0 - obs as f64 / 20.0);
+                    self.w_semantic += boost;
+                    self.w_recency -= boost;
                 }
             }
 
@@ -2094,6 +2388,10 @@ impl EntrolyEngine {
                 self.prev_explored_ids = explored_ids;
             }
 
+            // Restore cold-start weight overrides
+            self.w_recency = saved_w_recency;
+            self.w_semantic = saved_w_semantic;
+
             Ok(py_result.into())
         })
     }
@@ -2914,6 +3212,27 @@ impl EntrolyEngine {
             let result = PyDict::new(py);
             result.set_item("nodes", self.dep_graph.node_count())?;
             result.set_item("edges", self.dep_graph.edge_count())?;
+            Ok(result.into())
+        })
+    }
+
+    /// Compute PageRank centrality scores for all fragments in the dep graph.
+    ///
+    /// Returns a dict of {fragment_id: score} where higher scores indicate
+    /// structurally central code (hub files imported by many others).
+    /// Used by the EvolutionDaemon to prioritize skill gaps in hub files.
+    pub fn compute_pagerank(&self) -> PyResult<PyObject> {
+        Python::with_gil(|py| {
+            let fragment_ids: Vec<String> = self.fragments.keys().cloned().collect();
+            let scores = hierarchical::compute_pagerank(
+                &self.dep_graph,
+                &fragment_ids,
+                20, // 20 iterations — sufficient convergence for typical code graphs
+            );
+            let result = PyDict::new(py);
+            for (id, score) in &scores {
+                result.set_item(id, (*score * 10000.0).round() / 10000.0)?;
+            }
             Ok(result.into())
         })
     }

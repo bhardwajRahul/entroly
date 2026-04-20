@@ -46,6 +46,6 @@
   ],
   "repository": { "type": "git", "url": "https://github.com/juyterman1000/entroly" },
   "author": "Ebbiforge Team",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "engines": { "node": ">=16.0.0" }
 }
