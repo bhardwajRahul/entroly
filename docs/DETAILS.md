@@ -885,7 +885,7 @@ Integrates with [hippocampus-sharp-memory](https://pypi.org/project/hippocampus-
 
 ## License
 
-MIT
+Apache-2.0
 
 ---
 
