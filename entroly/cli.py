@@ -602,7 +602,10 @@ def cmd_autotune(args):
     try:
         from bench.autotune import autotune
         result = autotune(iterations=args.iterations)
-        print(f"\n  {C.GREEN}{C.BOLD}Best score: {result.get('final_score', 0):.4f}{C.RESET}")
+        # composite_score = 0.50·recall + 0.25·precision + 0.25·context_efficiency
+        # on bench/cases.json. Range [0, 1]; higher is better.
+        print(f"\n  {C.GREEN}{C.BOLD}Best composite score: {result.get('final_score', 0):.4f} / 1.0{C.RESET}")
+        print(f"  {C.GRAY}= 0.50·recall + 0.25·precision + 0.25·efficiency on bench/cases.json{C.RESET}")
         print(f"  {C.GRAY}Config saved to tuning_config.json{C.RESET}")
         print(f"  {C.GRAY}To undo: entroly autotune --rollback{C.RESET}\n")
     except ImportError:
@@ -722,9 +725,10 @@ def cmd_proxy(args):
   {C.BOLD}To use:{C.RESET} Set your AI tool's API base URL to:
     {C.CYAN}http://localhost:{config.port}/v1{C.RESET}
 
-  {C.GRAY}Every LLM request is intercepted -> optimized (ECC + EGTC + IOS) -> forwarded.{C.RESET}
-  {C.GRAY}< 10ms overhead. Press Ctrl+C to stop.{C.RESET}
+  {C.GRAY}Every LLM request is intercepted -> optimized -> forwarded.{C.RESET}
+  {C.GRAY}Live pipeline latency: http://localhost:9378 — or `entroly status`.{C.RESET}
   {C.GRAY}File watcher active — new/modified files auto-indexed every 120s.{C.RESET}
+  {C.GRAY}Press Ctrl+C to stop.{C.RESET}
 """)
 
     try:
@@ -1357,31 +1361,45 @@ def cmd_learn(args):
         success_rate = (confidence / total) * 100
         print(f"    Success rate:       {success_rate:.0f}%")
 
-    learnings = []
-    if confusion > total * 0.3 and total > 5:
-        learnings.append("High confusion rate. Consider --quality max.")
-    if rephrases > total * 0.2 and total > 5:
-        learnings.append("Frequent rephrases. Check /explain for dropped files.")
-    if trend == "declining":
-        learnings.append("Quality declining. R-D self-correction is active.")
+    # Learnings are thresholded observations from this session, not advice.
+    # We write the raw counts so the user (or their agent) can decide what to do.
+    learnings: list[str] = []
+    if total > 5:
+        if confusion > total * 0.3:
+            learnings.append(
+                f"Confusion on {confusion}/{total} requests ({confusion*100//total}%). "
+                f"Above the 30% threshold — consider `entroly proxy --quality max` or increasing budget."
+            )
+        if rephrases > total * 0.2:
+            learnings.append(
+                f"Rephrases detected on {rephrases}/{total} requests ({rephrases*100//total}%). "
+                f"Above the 20% threshold — inspect dropped fragments at /explain."
+            )
+        if trend == "declining":
+            learnings.append(
+                f"Quality trend: declining (confident={confidence}/{total})."
+            )
+    if total <= 5:
+        learnings.append(f"Only {total} requests assessed — need >5 for reliable signal.")
 
-    if learnings:
-        print(f"\n  {C.BOLD}Learnings:{C.RESET}")
-        for msg in learnings:
-            print(f"    {C.YELLOW}• {msg}{C.RESET}")
+    print(f"\n  {C.BOLD}Observations:{C.RESET}")
+    for msg in learnings or ["No thresholds crossed."]:
+        print(f"    {C.YELLOW}• {msg}{C.RESET}")
 
-    if getattr(args, "apply", False) and learnings:
+    if getattr(args, "apply", False) and learnings and total > 5:
         for fname in ["CLAUDE.md", "AGENTS.md"]:
             fpath = Path.cwd() / fname
             if fpath.exists():
                 existing = fpath.read_text(encoding="utf-8", errors="replace")
                 if "## Entroly Learnings" not in existing:
-                    section = "\n\n## Entroly Learnings (auto-generated)\n\n"
+                    import time as _time
+                    stamp = _time.strftime("%Y-%m-%d")
+                    section = f"\n\n## Entroly Learnings ({stamp}, n={total})\n\n"
                     section += "\n".join(f"- {msg}" for msg in learnings) + "\n"
                     fpath.write_text(existing + section, encoding="utf-8")
                     print(f"\n  {C.GREEN}Written learnings to {fname}{C.RESET}")
                 else:
-                    print(f"\n  {C.GRAY}{fname} already has learnings section{C.RESET}")
+                    print(f"\n  {C.GRAY}{fname} already has learnings section — remove the old one to refresh.{C.RESET}")
                 break
 
     print()
@@ -1488,7 +1506,7 @@ def cmd_go(args):
   {C.GREEN}Dashboard:{C.RESET}  http://localhost:9378
 
   {C.BOLD}Point your AI tool's API base URL to the proxy URL above.{C.RESET}
-  {C.GRAY}Every request: intercepted → optimized → forwarded. <10ms overhead.{C.RESET}
+  {C.GRAY}Every request: intercepted → optimized → forwarded. Live latency on the dashboard.{C.RESET}
   {C.GRAY}Press Ctrl+C to stop.{C.RESET}
 """)
 
@@ -2200,31 +2218,28 @@ def cmd_role(args):
     """entroly role — role-based weight presets for different developer types (Gap #49)."""
     print(f"\n{C.CYAN}{C.BOLD}  Entroly Role Presets{C.RESET}\n")
 
+    # Starting-point presets — not empirically calibrated. Run `entroly autotune`
+    # after applying to adapt weights to your codebase on bench/cases.json.
     roles = {
         "frontend": {
             "description": "Frontend developer (React, Vue, CSS)",
             "weights": {"recency": 0.25, "frequency": 0.30, "semantic": 0.30, "entropy": 0.15},
-            "note": "Higher semantic + frequency for component reuse patterns",
         },
         "backend": {
             "description": "Backend developer (API, database, services)",
             "weights": {"recency": 0.30, "frequency": 0.20, "semantic": 0.25, "entropy": 0.25},
-            "note": "Balanced with higher entropy for diverse system interactions",
         },
         "sre": {
             "description": "SRE / DevOps (infra, CI/CD, monitoring)",
             "weights": {"recency": 0.35, "frequency": 0.15, "semantic": 0.20, "entropy": 0.30},
-            "note": "High recency + entropy for fast-changing infra context",
         },
         "data": {
             "description": "Data engineer / ML (SQL, pipelines, notebooks)",
             "weights": {"recency": 0.20, "frequency": 0.30, "semantic": 0.30, "entropy": 0.20},
-            "note": "Higher frequency + semantic for repeated query patterns",
         },
         "fullstack": {
             "description": "Full-stack developer (balanced across all areas)",
             "weights": {"recency": 0.25, "frequency": 0.25, "semantic": 0.25, "entropy": 0.25},
-            "note": "Equal weights for broad codebase interaction",
         },
     }
 
@@ -2242,8 +2257,9 @@ def cmd_role(args):
             w = info["weights"]
             print(f"  {C.CYAN}{name:12s}{C.RESET} {info['description']}")
             print(f"               R={w['recency']:.2f}  F={w['frequency']:.2f}  "
-                  f"S={w['semantic']:.2f}  E={w['entropy']:.2f}")
-            print(f"               {C.GRAY}{info['note']}{C.RESET}\n")
+                  f"S={w['semantic']:.2f}  E={w['entropy']:.2f}\n")
+        print(f"  {C.GRAY}Presets are starting points. Run {C.CYAN}entroly autotune{C.GRAY} after applying "
+              f"to calibrate on your codebase.{C.RESET}")
         print(f"  Apply with: {C.CYAN}entroly role apply <name>{C.RESET}\n")
 
     elif action == "apply":
@@ -2268,7 +2284,7 @@ def cmd_role(args):
         w = role["weights"]
         print(f"    R={w['recency']:.2f}  F={w['frequency']:.2f}  "
               f"S={w['semantic']:.2f}  E={w['entropy']:.2f}")
-        print(f"    {C.GRAY}{role['note']}{C.RESET}\n")
+        print(f"    {C.GRAY}Run {C.CYAN}entroly autotune{C.GRAY} to calibrate these on your codebase.{C.RESET}\n")
 
 
 def cmd_completions(args):
