@@ -343,13 +343,17 @@ def test_optimize_selects_within_budget():
 test("Optimize stays within budget", test_optimize_selects_within_budget)
 
 def test_optimize_adaptive_budget():
-    """Bug tracing query should get 1.5x budget."""
+    """Bug tracing query surfaces a 1.5x recommended budget (advisory)."""
     e = sc.EntrolyEngine()
     for i in range(10):
         e.ingest(f"def func_{i}(): return {i}", f"f{i}.py", 50, False)
     r = e.optimize(200, "fix the crash bug")
-    assert r["effective_budget"] == 300, f"BugTracing should get 1.5x: {r['effective_budget']}"
-test("Optimize adaptive budget (bug=1.5x)", test_optimize_adaptive_budget)
+    # effective_budget is capped at the caller's token_budget (hard ceiling —
+    # downstream context windows don't tolerate silent expansion). The 1.5x
+    # multiplier is surfaced as recommended_budget for the caller to opt in.
+    assert r["effective_budget"] == 200, f"effective_budget must respect cap: {r['effective_budget']}"
+    assert r["recommended_budget"] == 300, f"BugTracing should recommend 1.5x: {r['recommended_budget']}"
+test("Optimize adaptive budget (bug=1.5x recommended)", test_optimize_adaptive_budget)
 
 def test_optimize_pinned_always_included():
     e = sc.EntrolyEngine()
