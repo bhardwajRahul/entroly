@@ -144,4 +144,4 @@ python -m bench.accuracy --benchmark truthfulqa --samples 100
 python -m bench.accuracy --benchmark longbench  --samples 100
 ```
 
-Engine version: `entroly-core v0.8.6` (BM25+GGCR retrieval, IOS selection)
+Engine version: `entroly-core v0.9.0` (BM25+GGCR retrieval, IOS selection, hierarchical Bayesian prior)

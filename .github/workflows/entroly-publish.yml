@@ -91,7 +91,8 @@ jobs:
 
   publish-npm:
     needs: build-and-push
-    if: startsWith(github.ref, 'refs/tags/entroly-v')
+    # Temporarily disabled — publishing manually.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

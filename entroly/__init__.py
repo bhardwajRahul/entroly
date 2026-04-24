@@ -24,7 +24,7 @@ Quick Setup (Claude Code)::
 
 """
 
-__version__ = "0.8.6"
+__version__ = "0.9.0"
 
 # SDK: 3-line integration for any AI application
 try:
