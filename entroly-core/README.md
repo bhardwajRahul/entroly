@@ -36,4 +36,4 @@ from entroly_core import ContextFragment, py_knapsack_optimize, py_shannon_entro
 
 ## License
 
-MIT
+Apache-2.0
