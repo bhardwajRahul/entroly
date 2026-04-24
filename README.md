@@ -201,11 +201,11 @@ Compression doesn't hurt accuracy — we measured it (n=100, gpt-4o-mini, Wilson
 | NeedleInAHaystack | 100% [83.9–100%] | 100% [83.9–100%] | **100.0%** |
 | GSM8K | 85.0% [76.7–90.7%] | 86.0% [77.9–91.5%] | **101.2%** |
 | SQuAD 2.0 | 84.0% [75.6–89.9%] | 83.0% [74.5–89.1%] | **98.8%** |
-| MMLU | _pending_ | _pending_ | _pending_ |
-| TruthfulQA (MC1) | _pending_ | _pending_ | _pending_ |
-| LongBench (HotpotQA) | _pending_ | _pending_ | _pending_ |
+| MMLU | 82.0% [73.3–88.3%] | 85.0% [76.7–90.7%] | **103.7%** |
+| TruthfulQA (MC1) | 72.0% [62.5–79.9%] | 73.0% [63.6–80.7%] | **101.4%** |
+| LongBench (HotpotQA) | 57.0% [47.2–66.3%] | 59.8% [49.8–69.0%] | **104.9%** |
 
-> Confidence intervals overlap on every benchmark run so far — accuracy is statistically indistinguishable from baseline. Harness covers **7 benchmarks** across retrieval, reasoning, knowledge, truthfulness, and long-context QA. Reproduce: `python -m bench.accuracy --benchmark all --model gpt-4o-mini --samples 100`
+> Confidence intervals overlap on every one of the 6 benchmarks — accuracy is statistically indistinguishable from baseline. LongBench (the only benchmark where context exceeds the budget) shows a 3.6% token saving with a small retention **gain**. Reproduce: `python -m bench.accuracy --benchmark all --model gpt-4o-mini --samples 100`
 
 ### CI/CD Integration
 

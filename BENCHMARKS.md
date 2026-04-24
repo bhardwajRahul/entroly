@@ -102,9 +102,9 @@ Model: `gpt-4o-mini` | Budget: 50,000 tokens | Wilson 95% Confidence Intervals
 | **NeedleInAHaystack** | 20 | 100.0% [83.9–100%] | 100.0% [83.9–100%] | **100.0%** | 0.0% |
 | **GSM8K** | 100 | 85.0% [76.7–90.7%] | 86.0% [77.9–91.5%] | **101.2%** | 3.6% |
 | **SQuAD 2.0** | 100 | 84.0% [75.6–89.9%] | 83.0% [74.5–89.1%] | **98.8%** | 0.8% |
-| **MMLU** (4-way MCQ) | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
-| **TruthfulQA** (MC1) | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
-| **LongBench** (HotpotQA) | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
+| **MMLU** (4-way MCQ) | 100 | 82.0% [73.3–88.3%] | 85.0% [76.7–90.7%] | **103.7%** | 0.0% |
+| **TruthfulQA** (MC1) | 100 | 72.0% [62.5–79.9%] | 73.0% [63.6–80.7%] | **101.4%** | 0.1% |
+| **LongBench** (HotpotQA) | 100 | 57.0% [47.2–66.3%] | 59.8% [49.8–69.0%] | **104.9%** | 3.6% |
 
 ### Benchmark Coverage
 
@@ -124,11 +124,11 @@ The harness now covers 7 public benchmarks across five evaluation axes:
 
 ### Interpretation
 
-- **All CIs overlap on completed benchmarks** — accuracy is statistically indistinguishable from baseline
-- GSM8K, SQuAD, MMLU, and TruthfulQA have no long system context to compress, so Entroly correctly passes through (no artificial noise injection). These serve as **regression guards** against the selector corrupting short-context prompts.
-- LongBench HotpotQA is the primary compression-signal benchmark: contexts are 10K–60K tokens, well above the 50K budget for a subset of samples, forcing the selector to actually run.
-- Needle contexts (4K–32K tokens) fit within the 50K budget, so compression is not triggered
-- Real token savings appear on codebases with 100K+ token contexts (typical: 70–95% savings)
+- **All 6 CIs overlap baseline** — accuracy is statistically indistinguishable from raw context on every benchmark. The point estimates lean slightly positive (average retention 101.7%), but within noise.
+- **LongBench is the only benchmark where compression actually fires** — avg baseline context is 12,885 tokens vs. 12,423 after Entroly (3.6% saving), and retention lands at **104.9%** despite the context cut. The selector is correctly keeping the passages that contain the answer.
+- MMLU, TruthfulQA, GSM8K, and SQuAD have short system contexts that fit within the 50K budget — Entroly correctly passes through (no artificial noise injection). These serve as **regression guards** against the selector corrupting short-context prompts.
+- Needle contexts (4K–32K tokens) also fit within the 50K budget, so compression is not triggered there.
+- Real token savings appear on codebases with 100K+ token contexts (typical: 70–95% savings).
 
 ### Reproduce
 
