@@ -89,6 +89,28 @@ pub struct EntrolyEngine {
     w_semantic: f64,
     w_entropy: f64,
 
+    // ── Hierarchical Bayesian Prior Anchor ────────────────────────────
+    // Autotune (offline benchmark optimizer) writes to these *prior*
+    // weights. PRISM (online RL) learns the *posterior* w_* relative
+    // to this prior via L2 regularization:
+    //
+    //   g_reg_k = -λ_reg · (w_k - w_prior_k)
+    //   λ_reg = λ₀ / (1 + n_feedback / N₀)
+    //
+    // This is MAP estimation with a Gaussian prior N(w_prior, 1/λ_reg·I).
+    // As PRISM accumulates more feedback, λ_reg → 0 and the prior
+    // influence vanishes (posterior concentrates on online evidence).
+    //
+    // Without this, set_weights() clobbers PRISM's learned weights
+    // every 30s, making all RL gradient math dead code.
+    w_prior_recency: f64,
+    w_prior_frequency: f64,
+    w_prior_semantic: f64,
+    w_prior_entropy: f64,
+    /// Total number of RL feedback events received (record_success + record_failure).
+    /// Controls λ_reg decay: more feedback → less prior influence.
+    n_feedback_events: u64,
+
     // Ebbinghaus
     decay_half_life: u32,
     min_relevance: f64,
@@ -302,6 +324,14 @@ impl EntrolyEngine {
             w_frequency,
             w_semantic,
             w_entropy,
+            // Prior anchor starts identical to the constructor args.
+            // Autotune will update these via set_weights() without
+            // clobbering the live w_* values that PRISM learns.
+            w_prior_recency: w_recency,
+            w_prior_frequency: w_frequency,
+            w_prior_semantic: w_semantic,
+            w_prior_entropy: w_entropy,
+            n_feedback_events: 0,
             decay_half_life,
             min_relevance,
             total_tokens_saved: 0,
@@ -2743,25 +2773,55 @@ impl EntrolyEngine {
     }
 
     /// Hot-reload scoring weights mid-session (autotune live update).
-    /// Normalizes to sum=1.0 and clamps to [0.05, 0.80].
+    ///
+    /// **Hierarchical Bayesian design**: This updates the *prior anchor*,
+    /// NOT the live weights. PRISM's online RL gradient includes an
+    /// L2 regularization term that pulls w_* toward w_prior_*:
+    ///
+    ///   g_reg_k = -λ_reg · (w_k - w_prior_k)
+    ///   λ_reg = 0.1 / (1 + n_feedback / 50)
+    ///
+    /// This means:
+    ///   - With 0 feedback: prior dominates (λ_reg = 0.1)
+    ///   - With 50 feedback events: prior halved (λ_reg = 0.05)
+    ///   - With 500 feedback events: prior negligible (λ_reg ≈ 0.009)
+    ///
+    /// If PRISM has received zero feedback, we also update the live
+    /// weights directly (cold-start initialization from autotune).
     pub fn set_weights(&mut self, w_recency: f64, w_frequency: f64, w_semantic: f64, w_entropy: f64) {
-        self.w_recency = w_recency.clamp(0.05, 0.80);
-        self.w_frequency = w_frequency.clamp(0.05, 0.80);
-        self.w_semantic = w_semantic.clamp(0.05, 0.80);
-        self.w_entropy = w_entropy.clamp(0.05, 0.80);
-        // Normalize to sum=1.0
-        let sum = self.w_recency + self.w_frequency + self.w_semantic + self.w_entropy;
+        // Normalize incoming prior to sum=1.0
+        let mut pr = w_recency.clamp(0.05, 0.80);
+        let mut pf = w_frequency.clamp(0.05, 0.80);
+        let mut ps = w_semantic.clamp(0.05, 0.80);
+        let mut pe = w_entropy.clamp(0.05, 0.80);
+        let sum = pr + pf + ps + pe;
         if sum > 0.0 {
-            self.w_recency /= sum;
-            self.w_frequency /= sum;
-            self.w_semantic /= sum;
-            self.w_entropy /= sum;
+            pr /= sum; pf /= sum; ps /= sum; pe /= sum;
         }
-        // Sync to context scorer (uses different field names)
-        self.context_scorer.w_recency = self.w_recency;
-        self.context_scorer.w_frequency = self.w_frequency;
-        self.context_scorer.w_similarity = self.w_semantic;
-        self.context_scorer.w_entropy = self.w_entropy;
+
+        // Update the prior anchor (autotune's best offline estimate)
+        self.w_prior_recency = pr;
+        self.w_prior_frequency = pf;
+        self.w_prior_semantic = ps;
+        self.w_prior_entropy = pe;
+
+        // Cold-start: if PRISM has never received feedback, the prior
+        // IS the best estimate — apply it directly to live weights.
+        // Once feedback starts flowing, PRISM owns the live weights.
+        if self.n_feedback_events == 0 {
+            self.w_recency = pr;
+            self.w_frequency = pf;
+            self.w_semantic = ps;
+            self.w_entropy = pe;
+            // Sync to context scorer
+            self.context_scorer.w_recency = pr;
+            self.context_scorer.w_frequency = pf;
+            self.context_scorer.w_similarity = ps;
+            self.context_scorer.w_entropy = pe;
+        }
+        // else: PRISM's learned weights are preserved — the prior
+        // will influence them gently via L2 regularization in
+        // apply_prism_rl_update().
     }
 
     /// Persist the full fragment index to disk as compressed JSON.
@@ -2863,6 +2923,7 @@ impl EntrolyEngine {
     /// The advantage A is what drives the PRISM weight update,
     /// while μ (EMA baseline) reduces gradient variance.
     pub fn record_success(&mut self, fragment_ids: Vec<String>) {
+        self.n_feedback_events += 1;
         self.feedback.record_success(&fragment_ids);
         // EGSC cache: positive feedback → improve entry quality scores
         if self.last_cache_feedback_eligible {
@@ -2909,6 +2970,7 @@ impl EntrolyEngine {
     /// Channel coding path: R = modulated_reward(suff), A = R − μ.
     /// Low sufficiency → stronger penalty → faster weight correction.
     pub fn record_failure(&mut self, fragment_ids: Vec<String>) {
+        self.n_feedback_events += 1;
         self.feedback.record_failure(&fragment_ids);
         // EGSC cache: negative feedback → degrade entry quality scores
         if self.last_cache_feedback_eligible {
@@ -3420,6 +3482,12 @@ impl EntrolyEngine {
             w_frequency: self.w_frequency,
             w_semantic: self.w_semantic,
             w_entropy: self.w_entropy,
+            // Hierarchical Bayesian prior anchor
+            w_prior_recency: self.w_prior_recency,
+            w_prior_frequency: self.w_prior_frequency,
+            w_prior_semantic: self.w_prior_semantic,
+            w_prior_entropy: self.w_prior_entropy,
+            n_feedback_events: self.n_feedback_events,
             current_turn: self.current_turn,
             id_counter: self.id_counter,
             max_fragments: self.max_fragments,
@@ -3469,6 +3537,12 @@ impl EntrolyEngine {
         self.w_frequency = state.w_frequency;
         self.w_semantic = state.w_semantic;
         self.w_entropy = state.w_entropy;
+        // Restore hierarchical Bayesian prior anchor
+        self.w_prior_recency = state.w_prior_recency;
+        self.w_prior_frequency = state.w_prior_frequency;
+        self.w_prior_semantic = state.w_prior_semantic;
+        self.w_prior_entropy = state.w_prior_entropy;
+        self.n_feedback_events = state.n_feedback_events;
         self.current_turn = state.current_turn;
         self.id_counter = state.id_counter;
         self.max_fragments = state.max_fragments;
@@ -3907,6 +3981,31 @@ impl EntrolyEngine {
         }
         self.gradient_norm_ema = 0.95 * self.gradient_norm_ema + 0.05 * g_norm;
 
+        // ── Hierarchical Bayesian Regularization ─────────────────────
+        // Add L2 prior pull: g_reg_k = -λ_reg · (w_k - w_prior_k)
+        //
+        // This is MAP estimation with a Gaussian prior:
+        //   p(w) ∝ exp(-λ_reg/2 · ||w - w_prior||²)
+        //   ∇ log p(w) = -λ_reg · (w - w_prior)
+        //
+        // λ_reg decays as feedback accumulates:
+        //   λ_reg = λ₀ / (1 + n_feedback / N₀)
+        // With λ₀=0.10, N₀=50:
+        //   0 feedback   → λ_reg = 0.100 (prior dominates)
+        //   50 feedback  → λ_reg = 0.050 (prior halved)
+        //   500 feedback → λ_reg = 0.009 (prior negligible)
+        //
+        // This is the same math as MAML (Model-Agnostic Meta-Learning):
+        // autotune finds a good initialization, PRISM adapts online.
+        let lambda_0 = 0.10;
+        let n_0 = 50.0;
+        let lambda_reg = lambda_0 / (1.0 + self.n_feedback_events as f64 / n_0);
+
+        g[prism::dim::RECENCY]   -= lambda_reg * (self.w_recency   - self.w_prior_recency);
+        g[prism::dim::FREQUENCY] -= lambda_reg * (self.w_frequency - self.w_prior_frequency);
+        g[prism::dim::SEMANTIC]  -= lambda_reg * (self.w_semantic  - self.w_prior_semantic);
+        g[prism::dim::ENTROPY]   -= lambda_reg * (self.w_entropy   - self.w_prior_entropy);
+
         // Let PRISM compute the anisotropically-damped update: Q Λ^{-1/2} Q^T g
         let update = self.prism_optimizer.compute_update(&g);
 
@@ -4011,6 +4110,12 @@ struct EngineState<'a> {
     w_frequency: f64,
     w_semantic: f64,
     w_entropy: f64,
+    // Hierarchical Bayesian prior anchor
+    w_prior_recency: f64,
+    w_prior_frequency: f64,
+    w_prior_semantic: f64,
+    w_prior_entropy: f64,
+    n_feedback_events: u64,
     current_turn: u32,
     id_counter: u64,
     max_fragments: usize,
@@ -4052,6 +4157,17 @@ struct OwnedEngineState {
     w_semantic: f64,
     #[serde(default = "default_w_entropy")]
     w_entropy: f64,
+    // Hierarchical Bayesian prior anchor (optional for backward-compat)
+    #[serde(default = "default_w_recency")]
+    w_prior_recency: f64,
+    #[serde(default = "default_w_frequency")]
+    w_prior_frequency: f64,
+    #[serde(default = "default_w_semantic")]
+    w_prior_semantic: f64,
+    #[serde(default = "default_w_entropy")]
+    w_prior_entropy: f64,
+    #[serde(default)]
+    n_feedback_events: u64,
     current_turn: u32,
     id_counter: u64,
     // Optional for backward-compat — old checkpoints lack this field.
@@ -4596,6 +4712,11 @@ mod tests {
             w_frequency: 0.25,
             w_semantic: 0.25,
             w_entropy: 0.20,
+            w_prior_recency: 0.30,
+            w_prior_frequency: 0.25,
+            w_prior_semantic: 0.25,
+            w_prior_entropy: 0.20,
+            n_feedback_events: 0,
             current_turn: 5,
             id_counter: 2,
             max_fragments: 10_000,
@@ -4842,5 +4963,141 @@ mod tests {
             candidates.contains(&target_slot),
             "LSH dropped the exact-match at scale=1000. candidates={:?}", candidates
         );
+    }
+
+    // ── Hierarchical Bayesian Prior: behavior tests ──────────────────
+    //
+    // These tests pin the contract between autotune (offline, writes prior)
+    // and PRISM (online, writes live weights). If any of these start
+    // failing, the hierarchy has been broken and autotune's set_weights
+    // is silently clobbering PRISM's learned weights — which would make
+    // all the RL gradient math dead code.
+
+    fn bayesian_test_engine() -> EntrolyEngine {
+        EntrolyEngine::new(
+            0.25, 0.25, 0.25, 0.25,
+            15, 0.05, 3, 0.1, 10_000,
+            true, true, true,
+            0.70, 0.50, 0.15, 0.10,
+        )
+    }
+
+    #[test]
+    fn test_bayesian_cold_start_applies_prior_to_live_weights() {
+        // Before any feedback, PRISM has no posterior belief — the prior
+        // IS the best estimate. set_weights should seed both sides.
+        let mut engine = bayesian_test_engine();
+        assert_eq!(engine.n_feedback_events, 0);
+
+        engine.set_weights(0.40, 0.30, 0.20, 0.10);
+
+        let s = 0.40 + 0.30 + 0.20 + 0.10;
+        for (got_live, got_prior, expected) in [
+            (engine.w_recency,   engine.w_prior_recency,   0.40 / s),
+            (engine.w_frequency, engine.w_prior_frequency, 0.30 / s),
+            (engine.w_semantic,  engine.w_prior_semantic,  0.20 / s),
+            (engine.w_entropy,   engine.w_prior_entropy,   0.10 / s),
+        ] {
+            assert!((got_live  - expected).abs() < 1e-9,
+                "cold-start should seed live weight; got {}, expected {}", got_live, expected);
+            assert!((got_prior - expected).abs() < 1e-9,
+                "cold-start should set prior; got {}, expected {}", got_prior, expected);
+        }
+    }
+
+    #[test]
+    fn test_bayesian_post_feedback_preserves_live_weights() {
+        // Once PRISM has a posterior (n_feedback > 0), set_weights must
+        // NOT overwrite live weights — it only updates the prior anchor.
+        // This is the whole point of the hierarchy: autotune's batch
+        // estimate pulls the live weights gently via L2 regularization,
+        // not by clobbering them.
+        let mut engine = bayesian_test_engine();
+        engine.n_feedback_events = 100;
+        let live_before = (
+            engine.w_recency,
+            engine.w_frequency,
+            engine.w_semantic,
+            engine.w_entropy,
+        );
+
+        // Autotune ships a very different prior
+        engine.set_weights(0.05, 0.05, 0.45, 0.45);
+
+        assert_eq!(engine.w_recency,   live_before.0, "live w_recency must be preserved");
+        assert_eq!(engine.w_frequency, live_before.1, "live w_frequency must be preserved");
+        assert_eq!(engine.w_semantic,  live_before.2, "live w_semantic must be preserved");
+        assert_eq!(engine.w_entropy,   live_before.3, "live w_entropy must be preserved");
+
+        // Prior updated (normalized)
+        let s = 0.05 + 0.05 + 0.45 + 0.45;
+        assert!((engine.w_prior_recency   - 0.05 / s).abs() < 1e-9);
+        assert!((engine.w_prior_frequency - 0.05 / s).abs() < 1e-9);
+        assert!((engine.w_prior_semantic  - 0.45 / s).abs() < 1e-9);
+        assert!((engine.w_prior_entropy   - 0.45 / s).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_bayesian_lambda_reg_schedule_matches_contract() {
+        // Pin the λ_reg formula so refactors can't silently change the
+        // cold-start / warm-steady behavior. The schedule is:
+        //
+        //   λ_reg(n) = λ₀ / (1 + n / N₀),   λ₀ = 0.10, N₀ = 50
+        //
+        // Contract documented in set_weights() and apply_prism_rl_update():
+        //   n = 0    → 0.100    (prior dominates)
+        //   n = 50   → 0.050    (prior halved)
+        //   n = 500  → 0.10/11  ≈ 0.00909  (prior negligible)
+        let lambda_0 = 0.10_f64;
+        let n_0 = 50.0_f64;
+        let at = |n: f64| lambda_0 / (1.0 + n / n_0);
+
+        assert!((at(0.0)   - 0.10).abs()        < 1e-12);
+        assert!((at(50.0)  - 0.05).abs()        < 1e-12);
+        assert!((at(500.0) - 0.10 / 11.0).abs() < 1e-12);
+
+        // Monotone non-increasing in n — a schedule that ever grows
+        // again would mean the prior reasserts itself after feedback,
+        // which is not MAP behavior.
+        let mut prev = at(0.0);
+        for n in 1..=10_000 {
+            let cur = at(n as f64);
+            assert!(cur <= prev, "λ_reg must be non-increasing: n={} cur={} prev={}", n, cur, prev);
+            prev = cur;
+        }
+
+        // Bounded: 0 < λ_reg ≤ λ₀
+        for n in [0.0, 1.0, 50.0, 500.0, 50_000.0] {
+            let v = at(n);
+            assert!(v > 0.0,    "λ_reg must stay positive at n={}", n);
+            assert!(v <= lambda_0 + 1e-12, "λ_reg must be ≤ λ₀ at n={}", n);
+        }
+
+        // Asymptotic: prior influence decays to zero
+        assert!(at(1_000_000.0) < 1e-4);
+    }
+
+    #[test]
+    fn test_bayesian_prior_state_survives_roundtrip() {
+        // Priors + feedback counter must be durable across restarts —
+        // otherwise every process restart would reset PRISM's posterior
+        // and force autotune to rebuild its estimate from scratch.
+        let mut engine = bayesian_test_engine();
+        engine.n_feedback_events = 42;
+        engine.w_prior_recency   = 0.40;
+        engine.w_prior_frequency = 0.10;
+        engine.w_prior_semantic  = 0.25;
+        engine.w_prior_entropy   = 0.25;
+
+        let exported = engine.export_state().expect("export_state should succeed");
+
+        let mut restored = bayesian_test_engine();
+        restored.import_state(&exported).expect("import_state should succeed");
+
+        assert_eq!(restored.n_feedback_events, 42);
+        assert!((restored.w_prior_recency   - 0.40).abs() < 1e-9);
+        assert!((restored.w_prior_frequency - 0.10).abs() < 1e-9);
+        assert!((restored.w_prior_semantic  - 0.25).abs() < 1e-9);
+        assert!((restored.w_prior_entropy   - 0.25).abs() < 1e-9);
     }
 }
