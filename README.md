@@ -35,7 +35,7 @@
 <p align="center">
   <img src="https://img.shields.io/pypi/v/entroly?color=blue&label=PyPI">
   <img src="https://img.shields.io/npm/v/entroly?color=red&label=npm">
-  <img src="https://img.shields.io/badge/Tests-484_passing-success">
+  <img src="https://img.shields.io/badge/Tests-834_passing-success">
   <img src="https://img.shields.io/badge/Latency-<10ms-purple">
   <img src="https://img.shields.io/badge/License-Apache_2.0-green">
 </p>
@@ -107,11 +107,13 @@ OPENAI_BASE_URL=http://localhost:9377/v1 your-app
 Drop it into your own code — two lines:
 
 ```python
-from entroly import optimize_context
+from entroly import compress, compress_messages
 
-result = optimize_context(query="fix auth bug", budget=8000)
-# result.fragments, result.tokens_saved, result.savings_pct
-# → 94.2% fewer tokens, same answer quality
+# Compress any content (code, JSON, logs, prose)
+compressed = compress(api_response, budget=2000)
+
+# Or compress a full LLM conversation
+messages = compress_messages(messages, budget=30000)
 ```
 
 **What happens under the hood:**
@@ -198,8 +200,7 @@ Zero cloud dependencies. Zero data exfiltration risk. Everything runs on your CP
 | **Aider** | `entroly wrap aider` |
 | **Windsurf / Cline / Cody** | `entroly init` → MCP server |
 | **Any LLM API** | `entroly proxy` → HTTP proxy on `localhost:9377` |
-| **LangChain / LlamaIndex** | `from entroly import optimize_context` |
-| **MCP-native** | `entroly mcp install` → exposes `optimize`, `retrieve`, `stats` |
+| **LangChain / LlamaIndex** | `from entroly import compress` |
 
 Also: OpenAI API • Anthropic API • Google Vertex • AWS Bedrock • Groq • Together • OpenRouter • Ollama • vLLM • 100+ models
 

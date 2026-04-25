@@ -1243,6 +1243,12 @@ _WRAP_AGENTS = {
         "env_val": "http://localhost:{port}/v1",
         "name": "Aider",
     },
+    "copilot": {
+        "cmd": ["github-copilot-cli"],
+        "env_key": "OPENAI_BASE_URL",
+        "env_val": "http://localhost:{port}/v1",
+        "name": "GitHub Copilot CLI",
+    },
     "cursor": {
         "cmd": None,
         "env_key": None,
