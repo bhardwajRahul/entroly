@@ -94,14 +94,49 @@ class RetentionReport:
 # ── LLM Client ────────────────────────────────────────────────────────
 
 
-def _call_llm(messages: list[dict], model: str, max_tokens: int = 1024) -> tuple[str, int, float]:
+def _call_llm(
+    messages: list[dict],
+    model: str,
+    max_tokens: int = 1024,
+    base_url: str | None = None,
+    api_key_env: str | None = None,
+) -> tuple[str, int, float]:
     """Call LLM API. Returns (response_text, token_count, latency_ms).
 
-    Supports Anthropic (claude-*), OpenAI (gpt-*), and Gemini (gemini-*) models.
+    Provider routing (base_url wins over model-name detection):
+      - base_url set                 → OpenAI-compatible custom endpoint
+        (Groq, Together, OpenRouter, Ollama, LM Studio, vLLM, Fireworks, ...)
+        Auth: api_key read from os.environ[api_key_env] if specified; missing
+        env var raises. If api_key_env is None, the SDK is called with a
+        "no-auth" sentinel — fine for self-hosted endpoints that ignore auth
+        (Ollama/LM Studio/vLLM). We deliberately do NOT fall back to
+        OPENAI_API_KEY here, to avoid leaking OpenAI credentials to a
+        third-party endpoint.
+      - model starts with "claude"   → Anthropic SDK
+      - model starts with "gemini"   → OpenAI SDK + Google's compat endpoint
+      - otherwise                    → OpenAI default
     """
     t0 = time.perf_counter()
 
-    if model.startswith("claude"):
+    if base_url:
+        import openai
+        if api_key_env is None:
+            api_key = "no-auth"
+        else:
+            api_key = os.environ.get(api_key_env)
+            if api_key is None:
+                raise ValueError(
+                    f"--api-key-env was set to {api_key_env!r}, but that env var is "
+                    f"not exported. Set it (e.g. `export {api_key_env}=...`), or omit "
+                    f"the flag for self-hosted endpoints that ignore auth."
+                )
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        resp = client.chat.completions.create(
+            model=model, max_tokens=max_tokens, messages=messages,
+        )
+        text = resp.choices[0].message.content or ""
+        tokens = resp.usage.total_tokens if resp.usage else 0
+    elif model.startswith("claude"):
         import anthropic
         client = anthropic.Anthropic()
         # Separate system message
@@ -149,8 +184,20 @@ def _call_llm(messages: list[dict], model: str, max_tokens: int = 1024) -> tuple
     return text, tokens, latency
 
 
-def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Rough cost estimate in USD."""
+def _estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    base_url: str | None = None,
+) -> float:
+    """Rough cost estimate in USD.
+
+    Custom providers (base_url set) return 0.0 — pricing varies wildly
+    across Groq / Together / OpenRouter / self-hosted, and the user
+    knows their own bill better than this table does.
+    """
+    if base_url:
+        return 0.0
     rates = {
         "claude-sonnet-4-5-20250929": (3.0, 15.0),
         "claude-3-5-haiku-20241022": (0.80, 4.0),
@@ -785,8 +832,14 @@ def run_benchmark(
     model: str = "gpt-4o-mini",
     samples: int = 50,
     budget: int = 50_000,
+    base_url: str | None = None,
+    api_key_env: str | None = None,
 ) -> RetentionReport:
-    """Run a benchmark, comparing baseline vs Entroly-compressed."""
+    """Run a benchmark, comparing baseline vs Entroly-compressed.
+
+    base_url + api_key_env are forwarded to _call_llm for OpenAI-compatible
+    custom providers (Groq, Together, OpenRouter, Ollama, LM Studio, vLLM, ...).
+    """
 
     # Load benchmark data
     loaders = {
@@ -812,11 +865,13 @@ def run_benchmark(
 
     # Run baseline
     print(f"\n  [1/2] Running baseline (no compression)...")
-    baseline = _run_mode(items, benchmark, model, "baseline", budget=None)
+    baseline = _run_mode(items, benchmark, model, "baseline", budget=None,
+                         base_url=base_url, api_key_env=api_key_env)
 
     # Run with Entroly compression
     print(f"  [2/2] Running with Entroly compression (budget={budget})...")
-    entroly = _run_mode(items, benchmark, model, "entroly", budget=budget)
+    entroly = _run_mode(items, benchmark, model, "entroly", budget=budget,
+                        base_url=base_url, api_key_env=api_key_env)
 
     # Compute retention
     retention = entroly.accuracy / max(baseline.accuracy, 1e-9)
@@ -839,6 +894,8 @@ def _run_mode(
     model: str,
     mode: str,
     budget: int | None,
+    base_url: str | None = None,
+    api_key_env: str | None = None,
 ) -> BenchmarkResult:
     """Run all items in a given mode."""
     correct = 0
@@ -859,13 +916,15 @@ def _run_mode(
             messages = _compress_messages(messages, budget, query=item["question"])
 
         try:
-            response, tokens, latency = _call_llm(messages, model)
+            response, tokens, latency = _call_llm(
+                messages, model, base_url=base_url, api_key_env=api_key_env,
+            )
             is_correct = _check_answer(response, item["expected"], benchmark, item.get("metadata"))
             if is_correct:
                 correct += 1
             total_tokens += tokens
             total_latency += latency
-            total_cost += _estimate_cost(model, tokens, 200)
+            total_cost += _estimate_cost(model, tokens, 200, base_url=base_url)
             details.append({
                 "index": i,
                 "correct": is_correct,
@@ -925,6 +984,13 @@ Examples:
   python -m bench.accuracy --benchmark gsm8k --model claude-sonnet-4-5-20250929
   python -m bench.accuracy --benchmark longbench --model gpt-4o-mini --samples 100
   python -m bench.accuracy --benchmark all --model gpt-4o-mini
+
+Custom OpenAI-compatible providers (Groq, Together, OpenRouter, Ollama, vLLM, ...):
+  python -m bench.accuracy --benchmark gsm8k --model llama-3.1-70b-versatile \\
+      --base-url https://api.groq.com/openai/v1 --api-key-env GROQ_API_KEY
+
+  python -m bench.accuracy --benchmark mmlu --model llama3.1:8b \\
+      --base-url http://localhost:11434/v1                  # Ollama local (no auth)
 """,
     )
     parser.add_argument(
@@ -944,6 +1010,17 @@ Examples:
         help="Entroly token budget (default: 50000)",
     )
     parser.add_argument(
+        "--base-url", type=str, default=None,
+        help="OpenAI-compatible custom endpoint (e.g. https://api.groq.com/openai/v1, "
+             "http://localhost:11434/v1 for Ollama). Routes requests through the OpenAI "
+             "SDK against this base URL.",
+    )
+    parser.add_argument(
+        "--api-key-env", type=str, default=None,
+        help="Name of the env var holding the API key for --base-url (default: OPENAI_API_KEY). "
+             "Use any var with empty/dummy value for self-hosted endpoints that ignore auth.",
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="Output results as JSON",
     )
@@ -955,10 +1032,19 @@ Examples:
         else [args.benchmark]
     )
 
+    if args.base_url:
+        print(
+            f"  Note: cost tracking disabled for custom provider {args.base_url}. "
+            f"total_cost_usd in the report will be 0.0 — your real bill is on the provider's dashboard."
+        )
+
     all_reports = []
     for bench in benchmarks:
         try:
-            report = run_benchmark(bench, args.model, args.samples, args.budget)
+            report = run_benchmark(
+                bench, args.model, args.samples, args.budget,
+                base_url=args.base_url, api_key_env=args.api_key_env,
+            )
             all_reports.append(report)
         except Exception as e:
             print(f"\n  ERROR: {bench} failed: {e}")
