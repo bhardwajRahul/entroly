@@ -29,7 +29,7 @@
 <h3 align="center">Your AI coding tools only see 5% of your codebase.<br/>Entroly gives them the full picture — for a fraction of the cost.</h3>
 
 <p align="center">
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>Live demo →</b></a>
+  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/dashboard.html"><b>📊 Live Dashboard →</b></a>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>Live demo →</b></a>
 </p>
 
 <p align="center">
@@ -207,6 +207,13 @@ Compression doesn't hurt accuracy — we measured it (n=100, gpt-4o-mini, Wilson
 | Berkeley Function Calling | 99.0% [94.5–99.8%] | 100.0% [96.3–100.0%] | **101.0%** |
 
 > Confidence intervals overlap on every one of the 7 benchmarks — accuracy is statistically indistinguishable from baseline. LongBench (the only benchmark where context exceeds the budget) shows a 3.6% token saving with a small retention **gain**. Reproduce: `python -m bench.accuracy --benchmark all --model gpt-4o-mini --samples 100`
+
+**Custom OpenAI-compatible providers** (Groq, Together, OpenRouter, Ollama, vLLM, ...):
+
+```bash
+python -m bench.accuracy --benchmark gsm8k --model llama-3.1-70b-versatile \
+    --base-url https://api.groq.com/openai/v1 --api-key-env GROQ_API_KEY
+```
 
 ### CI/CD Integration
 
