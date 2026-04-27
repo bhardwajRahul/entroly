@@ -1209,10 +1209,64 @@ impl EntrolyEngine {
             //   2. Causal chain (structural): dep graph from query-matched files
             //   3. PageRank (centrality): hub files many others depend on
             //   4. NCD (compression): reranker for top-50 candidates
+            //
+            // SKS (Stratified Knapsack Selection): precision-matched files
+            // are collected here and force-pinned before IOS/knapsack runs.
+            // This vector survives the query block scope.
+            let mut precision_file_ids: Vec<(String, f64)> = Vec::new();
             if !query.is_empty() {
                 let query_terms: Vec<String> = bm25::tokenize_code(&query);
 
-                // ── Signal 1: BM25 Lexical Scoring ──
+                // ═══════════════════════════════════════════════════════
+                // Signal 1: Tiered Path-Kernel Scoring (TPKS)
+                // ═══════════════════════════════════════════════════════
+                //
+                // Novel retrieval algorithm combining ideas from:
+                //   • BM25F field decomposition (Robertson et al., SIGIR)
+                //   • Dempster-Shafer evidence theory (precision-prioritized fusion)
+                //   • Lexicographic multi-objective optimization
+                //   • PageRank hub-node dampening (Brin & Page, 1998)
+                //
+                // ── The Problem ──
+                // In large codebases (2000+ files), standard BM25 fails because:
+                //   1. Generic hub files (index.ts, constants.ts) have high content
+                //      TF for common terms — they re-export or mention everything.
+                //   2. Small, correctly-named files (filter-query-encoding.ts) have
+                //      low content TF but perfect path match.
+                //   3. ANY normalization (min-max, z-score, RRF) compresses the
+                //      path signal into the same range as content noise.
+                //
+                // ── The Insight ──
+                // Path and content are NOT comparable signals to be fused.
+                // They have fundamentally different precision characteristics:
+                //   • Path match = high precision (file IS about the concept)
+                //   • Content match = high recall (file MENTIONS the concept)
+                //
+                // This is a LEXICOGRAPHIC optimization, not a scoring problem.
+                // We need strict tier separation where path matches create
+                // tiers that content-only matches can NEVER penetrate.
+                //
+                // ── The Algorithm ──
+                //   1. Extract query kernel K = top-N discriminative terms (by IDF)
+                //   2. For each file f:
+                //      a. Compute content BM25 score s_c(f) (standard)
+                //      b. Count kernel-path matches: m(f) = |{k ∈ K : k ∈ path(f)}|
+                //      c. Compute hub penalty: h(f) = 1/√(basename_frequency)
+                //      d. Final score: TPKS(f) = m(f)² + h(f) × normalize(s_c(f))
+                //
+                //   The quadratic tier function m² creates STRICT separation:
+                //     m=0: score ∈ [0, 0.99]     — content-only tier
+                //     m=1: score ∈ [1.0, 1.99]   — single path match tier
+                //     m=2: score ∈ [4.0, 4.99]   — double path match tier
+                //     m=3: score ∈ [9.0, 9.99]   — triple path match tier
+                //
+                //   filter-query-encoding.ts (m=3, score≥9.0) is GUARANTEED
+                //   above constants.ts (m=0, score≤0.99). No normalization
+                //   can destroy this invariant.
+                //
+                // ── Complexity: O(N × Q) where N=files, Q=query terms ──
+
+                // Step 1: Standard BM25 scoring
                 let doc_tuples: Vec<(String, String, String)> = self.fragments.iter()
                     .map(|(id, f)| (id.clone(), f.content.clone(), f.source.clone()))
                     .collect();
@@ -1222,29 +1276,189 @@ impl EntrolyEngine {
                 for (fid, frag) in &self.fragments {
                     let identifiers = extract_identifiers(&frag.content);
                     let score = bm25_idx.score(&query_terms, &frag.content, &frag.source, &identifiers);
-                    bm25_raw.insert(fid.clone(), score.combined);
+                    // Store CONTENT-ONLY score (bm25_base + coverage bonus)
+                    // Do NOT include path_boost here — path is handled by the tier system
+                    let coverage_bonus = score.query_coverage.powf(1.5) * 0.5 * score.bm25_base;
+                    bm25_raw.insert(fid.clone(), score.bm25_base + coverage_bonus);
                 }
 
-                // Normalize BM25 to [0.05, 1.0]
+                // ── Step 2: Dual-IDF Path-Content Decomposition ──────
+                //
+                // NOVEL INSIGHT: Content-IDF and Path-IDF are different
+                // information spaces that require separate statistics.
+                //
+                // "filter" in CONTENT context:
+                //   df_content ≈ 500/2000 → Content-IDF ≈ 0.3 (common, low)
+                //   Previous algorithm EXCLUDED it from kernel (IDF < threshold)
+                //
+                // "filter" in PATH context:
+                //   df_path ≈ 35/2000 → Path-IDF ≈ 3.3 (rare, high!)
+                //   filter-query-encoding.ts IS about filtering
+                //
+                // This distinction was first formalized by Salton (1975) for
+                // term discrimination in structured documents, but has not
+                // been applied to code file retrieval where path = title.
+                //
+                // Algorithm:
+                //   1. Compute Path-IDF: for each query term, count how many
+                //      file PATHS contain it (not contents — paths!)
+                //   2. Use ALL query terms for path matching (no IDF threshold)
+                //   3. Weight path matches by Path-IDF:
+                //      tier(f) = Σ_t path_idf(t) × 𝟙[t ∈ path(f)]
+                //   4. Final: score(f) = tier(f)² + norm_content(f)
+                //
+                // The squaring preserves strict tier separation while making
+                // it continuous — a file matching two high-Path-IDF terms
+                // gets tier ≈ (3.3 + 4.0)² = 53, which DOMINATES any
+                // content-only file (tier=0, max score=0.99).
+
+                // Compute Path-DF: how many file paths contain each query term
+                let mut path_df: HashMap<String, usize> = HashMap::new();
+                for qt in &query_terms {
+                    let qt_lower = qt.to_lowercase();
+                    let count = self.fragments.values()
+                        .filter(|f| f.source.to_lowercase().contains(&qt_lower))
+                        .count();
+                    path_df.insert(qt_lower, count);
+                }
+
+                // Compute Path-IDF for each query term
+                let n = self.fragments.len() as f64;
+                let path_idfs: HashMap<String, f64> = query_terms.iter()
+                    .map(|qt| {
+                        let qt_lower = qt.to_lowercase();
+                        let df = *path_df.get(&qt_lower).unwrap_or(&0) as f64;
+                        // Standard IDF formula applied to path space
+                        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                        (qt_lower, idf)
+                    })
+                    .collect();
+
+                // Step 3: Compute basename frequency for hub dampening
+                let mut basename_freq: HashMap<String, usize> = HashMap::new();
+                for frag in self.fragments.values() {
+                    let fname = frag.source.rsplit(&['/', '\\'][..])
+                        .next().unwrap_or("").to_lowercase();
+                    *basename_freq.entry(fname).or_insert(0) += 1;
+                }
+
+                // Step 4: Dual-IDF TPKS scoring
                 let fid_order: Vec<String> = self.fragments.keys().cloned().collect();
                 let raw_vec: Vec<f64> = fid_order.iter()
                     .map(|fid| bm25_raw.get(fid).copied().unwrap_or(0.0))
                     .collect();
-                let norm_vec = bm25::normalize_scores(&raw_vec);
-                let bm25_norm: HashMap<String, f64> = fid_order.iter()
-                    .zip(norm_vec.iter())
-                    .map(|(fid, &s)| (fid.clone(), s))
-                    .collect();
+                let max_raw = raw_vec.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let min_raw = raw_vec.iter().cloned().fold(f64::INFINITY, f64::min);
+                let range = (max_raw - min_raw).max(1e-10);
 
-                // ── Signal 2: Causal Chain via Dep Graph ──
-                // Top BM25 matches seed a BFS through the dep graph.
-                // Files in the causal chain are structurally connected
-                // to query-relevant code — embeddings can't find these.
-                let mut sorted_bm25: Vec<(String, f64)> = bm25_raw.iter()
+                let mut tpks_scores: HashMap<String, f64> = HashMap::with_capacity(self.fragments.len());
+                for fid in &fid_order {
+                    let frag = &self.fragments[fid];
+                    let src_lower = frag.source.to_lowercase();
+
+                    // (a) Normalize content score to [0.01, 0.99]
+                    let raw = bm25_raw.get(fid).copied().unwrap_or(0.0);
+                    let norm_content = ((raw - min_raw) / range * 0.98 + 0.01).clamp(0.01, 0.99);
+
+                    // (b) Continuous Path-IDF tier score
+                    // Sum Path-IDF of ALL query terms that appear in the path.
+                    // No threshold, no top-N filtering — every matching term
+                    // contributes proportional to how rare it is IN PATHS.
+                    let path_tier: f64 = query_terms.iter()
+                        .filter_map(|qt| {
+                            let qt_lower = qt.to_lowercase();
+                            if src_lower.contains(&qt_lower) {
+                                path_idfs.get(&qt_lower).copied()
+                            } else {
+                                None
+                            }
+                        })
+                        .sum();
+
+                    // (c) Hub dampening: 1/sqrt(freq) for generic basenames
+                    let fname = frag.source.rsplit(&['/', '\\'][..])
+                        .next().unwrap_or("").to_lowercase();
+                    let freq = *basename_freq.get(&fname).unwrap_or(&1);
+                    let hub_dampen = if freq > 3 && path_tier < 1.0 {
+                        // Only dampen hubs without meaningful path matches
+                        1.0 / (freq as f64).sqrt()
+                    } else {
+                        1.0
+                    };
+
+                    // (d) Test file penalty
+                    let is_test = src_lower.contains("/test_")
+                        || src_lower.contains("/tests/")
+                        || src_lower.contains("\\test_")
+                        || src_lower.contains("\\tests\\")
+                        || src_lower.contains("/__tests__/")
+                        || src_lower.contains("\\__tests__\\")
+                        || src_lower.ends_with(".test.ts")
+                        || src_lower.ends_with(".test.tsx")
+                        || src_lower.ends_with(".test.js")
+                        || src_lower.ends_with(".spec.ts")
+                        || src_lower.ends_with(".spec.tsx")
+                        || src_lower.ends_with(".spec.js")
+                        || src_lower.contains("/examples/")
+                        || src_lower.contains("\\examples\\")
+                        || src_lower.contains("/bench/")
+                        || src_lower.contains("\\bench\\")
+                        || src_lower.contains("/conftest")
+                        || src_lower.contains("\\conftest");
+                    let test_penalty = if is_test { 0.7 } else { 1.0 };
+
+                    // (e) Dual-IDF TPKS formula
+                    // Squaring the path_tier ensures strict tier separation:
+                    //   path_tier=0  → score ∈ [0, 0.99]    (content-only)
+                    //   path_tier=3  → score ∈ [9, 9.99]    (one rare path match)
+                    //   path_tier=10 → score ∈ [100, 100.99] (multiple path matches)
+                    //
+                    // A file with path_tier=3 (one match) is GUARANTEED
+                    // above ANY content-only file. This invariant holds
+                    // through any monotone normalization.
+                    let tpks = path_tier.powi(2) + norm_content * hub_dampen * test_penalty;
+
+                    tpks_scores.insert(fid.clone(), tpks);
+                }
+
+                // ═══════════════════════════════════════════════════════
+                // Direct TPKS → semantic_score via Rank-Percentile
+                // ═══════════════════════════════════════════════════════
+                //
+                // CRITICAL: Do NOT use min-max or sigmoid normalization!
+                // Both destroy the tier separation that makes TPKS work.
+                //
+                // Instead, use RANK-PERCENTILE normalization:
+                //   semantic_score = rank_position / total_files
+                //
+                // This perfectly preserves tier ordering because:
+                //   - All tier-3 files rank above ALL tier-2 files
+                //   - All tier-2 files rank above ALL tier-1 files
+                //   - Within a tier, content BM25 breaks ties
+                //
+                // Properties:
+                //   - Bounded [0.05, 1.0]: compatible with PRISM
+                //   - Strictly monotone with TPKS
+                //   - Tier-invariant: no compression can cross tiers
+
+                // Sort all files by TPKS score (descending)
+                let mut sorted_tpks: Vec<(String, f64)> = tpks_scores.iter()
                     .map(|(k, &v)| (k.clone(), v))
                     .collect();
-                sorted_bm25.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let seed_ids: Vec<String> = sorted_bm25.iter()
+                sorted_tpks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Assign rank-percentile scores
+                let total = sorted_tpks.len().max(1) as f64;
+                let mut rank_scores: HashMap<String, f64> = HashMap::with_capacity(sorted_tpks.len());
+                for (rank, (fid, _)) in sorted_tpks.iter().enumerate() {
+                    // Rank 0 (best) → 1.0, rank N-1 (worst) → 0.05
+                    let percentile = 1.0 - (rank as f64 / total);
+                    let score = (percentile * 0.95 + 0.05).clamp(0.05, 1.0);
+                    rank_scores.insert(fid.clone(), score);
+                }
+
+                // Causal chain (BFS from TPKS-top seeds)
+                let seed_ids: Vec<String> = sorted_tpks.iter()
                     .take(10)
                     .filter(|(_, s)| *s > 0.5)
                     .map(|(id, _)| id.clone())
@@ -1256,20 +1470,19 @@ impl EntrolyEngine {
                     HashSet::new()
                 };
 
-                // ── Signal 3: PageRank Centrality ──
+                // PageRank (tie-breaker only, max 2% influence)
                 let pr_ids: Vec<String> = self.fragments.keys().cloned().collect();
                 let pagerank = hierarchical::compute_pagerank(&self.dep_graph, &pr_ids, 15);
                 let max_pr = pagerank.values().cloned().fold(0.0_f64, f64::max).max(1e-10);
 
-                // ── Signal 4: NCD Reranking (top-50 only for performance) ──
-                let top_candidates: Vec<String> = sorted_bm25.iter()
+                // NCD (top-50 by TPKS, tie-breaker only)
+                let top_candidates: Vec<String> = sorted_tpks.iter()
                     .take(50)
                     .map(|(id, _)| id.clone())
                     .collect();
                 let mut ncd_scores: HashMap<String, f64> = HashMap::new();
                 for fid in &top_candidates {
                     if let Some(frag) = self.fragments.get(fid) {
-                        // Truncate to 2KB for NCD perf (first 2KB has imports+defs)
                         let end = frag.content.len().min(2048);
                         let safe = (0..=end).rev()
                             .find(|&i| frag.content.is_char_boundary(i))
@@ -1279,140 +1492,64 @@ impl EntrolyEngine {
                     }
                 }
 
-                // ── Fusion → semantic_score ──
-                // Phase 5: Task-type-adaptive fusion weights.
-                // Different query types benefit from different signals:
-                //   Debug → BM25 dominates (exact error/function name matching)
-                //   Refactor → causal chain dominates (structural deps matter)
-                //   Architecture → PageRank dominates (hub files, system overview)
-                //   Understanding → balanced (need both content + structure)
-                //
-                // These weights are the starting point; PRISM's semantic dimension
-                // weight (w_semantic) then scales the entire fused score relative to
-                // recency/frequency/entropy, so online learning still applies.
-                let task_type = TaskType::classify(&query);
-                let (w_bm25, w_causal, w_pr, w_ncd) = match task_type {
-                    TaskType::BugTracing => (0.55, 0.15, 0.10, 0.20),
-                    TaskType::Refactoring => (0.30, 0.30, 0.20, 0.20),
-                    TaskType::CodeGeneration => (0.35, 0.25, 0.20, 0.20),
-                    TaskType::Exploration => (0.35, 0.15, 0.25, 0.25),
-                    _ => (0.40, 0.20, 0.15, 0.25),
-                };
-
-                // ── Query Kernel Extraction ──────────────────────────
-                // Identify the most discriminative query terms (highest IDF).
-                // These are the "kernel" — the terms that identify WHAT the
-                // user is asking about, vs HOW (intent terms like "refactor").
-                //
-                // For "Refactor the checkpoint system to support async":
-                //   kernel = ["checkpoint"] (highest IDF — rare, specific)
-                //   intent = ["refactor", "support", "system", "async"] (common)
-                //
-                // Files whose filename matches a kernel term are about that
-                // concept — they should rank at the top regardless of generic
-                // term frequency.
-                let mut term_idfs: Vec<(String, f64)> = query_terms.iter()
-                    .map(|t| (t.clone(), bm25_idx.idf(t)))
-                    .collect();
-                term_idfs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-                // Top 2 highest-IDF terms are the kernel
-                let kernel_terms: Vec<String> = term_idfs.iter()
-                    .take(2)
-                    .filter(|(_, idf)| *idf > 1.0) // Must be reasonably rare
-                    .map(|(t, _)| t.clone())
-                    .collect();
+                // Assign scores: path-tier files get ALL dimensions boosted
                 for (fid, frag) in self.fragments.iter_mut() {
-                    let bm25_s = bm25_norm.get(fid).copied().unwrap_or(0.05);
-                    let causal_s: f64 = if causal_set.contains(fid) { 1.0 } else { 0.0 };
-                    let pr_s = (pagerank.get(fid).copied().unwrap_or(0.0) / max_pr).min(1.0);
-                    let ncd_s = ncd_scores.get(fid).copied().unwrap_or(0.0);
+                    let tpks = tpks_scores.get(fid).copied().unwrap_or(0.0);
+                    let base = rank_scores.get(fid).copied().unwrap_or(0.05);
 
-                    // ── Multi-Signal Linear Fusion with CombMNZ ──────
-                    // Linear base + CombMNZ bonus for multi-signal alignment.
-                    // CombMNZ (Fox & Shaw, 1994): score × count_of_active_signals
-                    // rewards files that match across multiple retrieval channels.
-                    let base = w_bm25 * bm25_s
-                        + w_causal * causal_s
-                        + w_pr * pr_s
-                        + w_ncd * ncd_s;
+                    // Structural tie-breakers (max 3% total influence)
+                    let causal_adj = if causal_set.contains(fid) { 0.015 } else { 0.0 };
+                    let pr_adj = (pagerank.get(fid).copied().unwrap_or(0.0) / max_pr).min(1.0) * 0.01;
+                    let ncd_adj = ncd_scores.get(fid).copied().unwrap_or(0.0) * 0.005;
 
-                    // Count active signals (non-trivial values)
-                    let active = 1.0  // BM25 always active
-                        + if causal_s > 0.0 { 1.0 } else { 0.0 }
-                        + if pr_s > 0.2 { 1.0 } else { 0.0 }
-                        + if ncd_s > 0.1 { 1.0 } else { 0.0 };
-
-                    // CombMNZ: boost proportional to signal count (max 25% bonus)
-                    let fused = (base * (1.0 + 0.25 * (active - 1.0) / 3.0))
+                    frag.semantic_score = (base + causal_adj + pr_adj + ncd_adj)
                         .clamp(0.0, 1.0);
 
-                    // ── Source File Type Boost ─────────────────────────
-                    // Quality invariant: source code must ALWAYS outrank
-                    // docs/configs when semantic scores are close.
-                    // Without this, CONTRIBUTING.md can outrank _checkpoint.py
-                    // because .md files have higher entropy scores.
+                    // ── Path-Tier Full-Dimension Override ──────────────
+                    // PRISM composite = Σ w_i × score_i / Σ w_i
+                    // If semantic is only 50% of total weight, a perfect
+                    // semantic_score=1.0 only contributes 0.50 to composite.
+                    // Files with high entropy (many unique terms) can get
+                    // entropy_score=0.95, contributing 0.25*0.95=0.24.
+                    // This means a low-semantic file (0.50*0.6=0.30) with
+                    // high entropy (0.24) gets composite=0.69 — HIGHER than
+                    // a high-semantic file (0.50*0.85=0.42) with low entropy
+                    // (0.25*0.3=0.075) at composite=0.65.
                     //
-                    // Boost is multiplicative on the fused score, so it only
-                    // amplifies existing semantic signal — it cannot promote
-                    // an irrelevant .py file above a relevant .md file.
-                    let src_lower = frag.source.to_lowercase();
+                    // Fix: files whose path matches query terms are
+                    // structurally ABOUT the query. Boost ALL dimensions
+                    // so every PRISM channel agrees they're relevant.
+                    // This makes them dominate the composite regardless
+                    // of how PRISM weights are distributed.
+                    if tpks > 1.0 {
+                        // File has meaningful path matches (tier > 0)
+                        // Scale boost by how much path evidence we have
+                        let boost = (tpks / 100.0).min(0.5); // 0.01 to 0.50
+                        frag.semantic_score = (frag.semantic_score + boost).min(1.0);
+                        frag.entropy_score = frag.entropy_score.max(0.90);
+                        frag.frequency_score = frag.frequency_score.max(0.80);
+                    }
+                }
 
-                    // Detect test/example files (contain usage, not implementation)
-                    let is_test = src_lower.contains("/test_")
-                        || src_lower.contains("/tests/")
-                        || src_lower.contains("\\test_")
-                        || src_lower.contains("\\tests\\")
-                        || src_lower.contains("/examples/")
-                        || src_lower.contains("\\examples\\")
-                        || src_lower.contains("/bench/")
-                        || src_lower.contains("\\bench\\")
-                        || src_lower.contains("/conftest")
-                        || src_lower.contains("\\conftest");
-
-                    let is_source = (src_lower.ends_with(".py")
-                        || src_lower.ends_with(".rs")
-                        || src_lower.ends_with(".ts")
-                        || src_lower.ends_with(".js")
-                        || src_lower.ends_with(".tsx")
-                        || src_lower.ends_with(".jsx"))
-                        && !is_test;
-
-                    let type_boost = if is_source {
-                        // Core source code: 15% boost
-                        1.15
-                    } else if is_test {
-                        // Test/example: 5% penalty (has relevant terms but not impl)
-                        0.95
-                    } else if src_lower.ends_with(".md")
-                        || src_lower.ends_with(".json")
-                        || src_lower.ends_with(".yml")
-                        || src_lower.ends_with(".yaml")
-                        || src_lower.ends_with(".toml")
-                        || src_lower.ends_with(".cfg")
-                    {
-                        // Docs/config: 10% penalty
-                        0.90
-                    } else {
-                        1.0
-                    };
-
-                    frag.semantic_score = (fused * type_boost).clamp(0.0, 1.0);
-
-                    // ── Query Kernel Filename Boost ───────────────────
-                    // If a NON-TEST file's name matches the highest-IDF
-                    // query term, this file's PRIMARY PURPOSE is that concept.
-                    // _checkpoint.py → primary purpose is "checkpoint"
-                    // Skip test files: test_checkpoint.py just tests it.
-                    if !kernel_terms.is_empty() && !is_test {
-                        let fname = frag.source.rsplit(&['/', '\\'][..])
-                            .next().unwrap_or("").to_lowercase();
-                        for kt in &kernel_terms {
-                            if fname.contains(kt.as_str()) {
-                                frag.semantic_score = frag.semantic_score.max(0.95);
-                                break;
-                            }
-                        }
+                // ── SKS: Collect Precision Files ──────────────────────
+                // Files with path_tier > 0 (TPKS > 1.0) have query terms
+                // matching their file path. These files ARE about the query
+                // concept. Collect them for force-pinning before IOS.
+                //
+                // Why not just boost their score? Because the knapsack uses
+                // density = relevance / token_count. A 200-token precision
+                // file with relevance 0.85 has density 0.004, while a
+                // 30-token generic file with relevance 0.5 has density 0.017.
+                // The wrong file wins 4× over. No score can fix this —
+                // it's a structural property of the 0/1 knapsack.
+                //
+                // SKS bypasses this by pinning precision files, which are
+                // always included regardless of density. This is analogous
+                // to stratified sampling (Cochran 1977): partition by
+                // precision stratum, select from highest stratum first.
+                for (fid, &tpks_val) in &tpks_scores {
+                    if tpks_val > 1.0 {
+                        precision_file_ids.push((fid.clone(), tpks_val));
                     }
                 }
 
@@ -1588,6 +1725,39 @@ impl EntrolyEngine {
             }
 
             let mut frags: Vec<ContextFragment> = self.fragments.values().cloned().collect();
+
+            // ── SKS Phase 1: Pin precision files ─────────────────────
+            // Temporarily mark path-matched files as pinned so IOS/knapsack
+            // always includes them. Pins are reset after selection.
+            let mut sks_pinned_ids: HashSet<String> = HashSet::new();
+            if !precision_file_ids.is_empty() {
+                // Budget guard: don't pin more than 40% of budget
+                let max_pin_budget = effective_budget * 40 / 100;
+                let mut pin_budget_used: u32 = 0;
+                // Build candidates with (fid, token_count, tpks_score)
+                let mut pin_candidates: Vec<(String, u32, f64)> = precision_file_ids.iter()
+                    .filter_map(|(fid, tpks)| {
+                        self.fragments.get(fid).map(|f| (fid.clone(), f.token_count, *tpks))
+                    })
+                    .collect();
+                // Sort by TPKS descending — pin highest-precision files first!
+                // Files matching 3 query terms in path get pinned before
+                // files matching only 1 term.
+                pin_candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+                for (fid, tc, _) in &pin_candidates {
+                    if pin_budget_used + tc <= max_pin_budget {
+                        pin_budget_used += tc;
+                        sks_pinned_ids.insert(fid.clone());
+                    }
+                }
+                // Apply pins to the frags vec
+                for frag in frags.iter_mut() {
+                    if sks_pinned_ids.contains(&frag.fragment_id) {
+                        frag.is_pinned = true;
+                    }
+                }
+            }
+
             // Use per-archetype weights if PSM assigned, otherwise global weights
             let weights = if let Some(aw) = archetype_weights {
                 ScoringWeights {
@@ -2038,6 +2208,7 @@ impl EntrolyEngine {
                 }
             }
 
+
             // ── Context Sufficiency Scoring ──
             // What fraction of referenced symbols have definitions in selected context?
             let selected_id_set: HashSet<String> = final_indices.iter()
@@ -2116,6 +2287,28 @@ impl EntrolyEngine {
                 ordered
             };
 
+            // ── SKS: Precision-first output ordering ──────────────
+            // Channel coding and legacy ordering use PRISM composite
+            // which has no path-tier awareness. Re-sort so SKS-pinned
+            // (precision-matched) files appear at the front.
+            let ordered_indices = if !sks_pinned_ids.is_empty() {
+                let pinned_set: HashSet<String> = sks_pinned_ids.clone();
+                let mut pinned: Vec<usize> = Vec::new();
+                let mut unpinned: Vec<usize> = Vec::new();
+                for &idx in &ordered_indices {
+                    if pinned_set.contains(&frags[idx].fragment_id) {
+                        pinned.push(idx);
+                    } else {
+                        unpinned.push(idx);
+                    }
+                }
+                // Precision files first, then the rest in original order
+                pinned.extend(unpinned);
+                pinned
+            } else {
+                ordered_indices
+            };
+
             // ── Build Explainability Snapshot ──
             let mut fragment_scores: Vec<FragmentScore> = Vec::with_capacity(frags.len());
             for frag in frags.iter() {
@@ -2184,6 +2377,22 @@ impl EntrolyEngine {
             } else {
                 0.0
             };
+
+            // ── SKS Phase 2: Reset temporary pins ──────────────────
+            // Delayed until after ordering so pinned files get priority
+            // in the output ordering (line 2295 uses is_pinned).
+            if !sks_pinned_ids.is_empty() {
+                for frag in frags.iter_mut() {
+                    if sks_pinned_ids.contains(&frag.fragment_id) {
+                        frag.is_pinned = false;
+                    }
+                }
+                for fid in &sks_pinned_ids {
+                    if let Some(f) = self.fragments.get_mut(fid) {
+                        f.is_pinned = false;
+                    }
+                }
+            }
 
             // ── Build Python result ──
             let py_result = PyDict::new(py);

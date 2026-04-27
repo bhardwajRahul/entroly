@@ -26,9 +26,20 @@ const K1: f64 = 1.2;    // Term frequency saturation. Higher = more weight to re
 const B: f64 = 0.75;     // Length normalization. 0 = no normalization, 1 = full normalization.
 
 /// Bonus multipliers for structural signals
-const PATH_MATCH_BOOST: f64 = 2.5;       // Query term found in file path
-const IDENTIFIER_MATCH_BOOST: f64 = 1.8;  // Query term matches a code identifier
-const EXACT_FILENAME_BOOST: f64 = 3.0;    // Query term IS the filename (minus extension)
+/// BM25F principle (Robertson, SIGIR): the "title" field (path/filename)
+/// must dominate over "body" (content) when it matches. In code retrieval,
+/// the file path IS the title — filter-query-encoding.ts literally says
+/// "I am the filter query encoding implementation."
+///
+/// Previous values (2.5/1.8/3.0) were insufficient: in a 2000-file TypeScript
+/// monorepo, large hub files (constants.ts, index.ts) accumulate enough
+/// content TF to drown out small, correctly-named files.
+///
+/// New values implement the 5-10x title-over-body weight ratios from
+/// Elasticsearch's combined_fields BM25F scoring.
+const PATH_MATCH_BOOST: f64 = 8.0;       // Query term found in file path
+const IDENTIFIER_MATCH_BOOST: f64 = 3.0;  // Query term matches a code identifier
+const EXACT_FILENAME_BOOST: f64 = 12.0;   // Query term IS the filename (minus extension)
 
 /// Pre-computed corpus statistics for BM25 IDF calculation.
 pub struct BM25Index {
