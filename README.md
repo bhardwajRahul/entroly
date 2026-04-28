@@ -229,9 +229,9 @@ Compression doesn't hurt accuracy — we measured it (n=100, gpt-4o-mini, Wilson
 | NeedleInAHaystack | 100% [83.9–100%] | 100% [83.9–100%] | **100.0%** |
 | GSM8K | 85.0% [76.7–90.7%] | 86.0% [77.9–91.5%] | **101.2%** |
 | SQuAD 2.0 | 84.0% [75.6–89.9%] | 83.0% [74.5–89.1%] | **98.8%** |
-| MMLU | 82.0% [73.3–88.3%] | 85.0% [76.7–90.7%] | **103.7%** |
-| TruthfulQA (MC1) | 72.0% [62.5–79.9%] | 73.0% [63.6–80.7%] | **101.4%** |
-| LongBench (HotpotQA) | 57.0% [47.2–66.3%] | 59.8% [49.8–69.0%] | **104.9%** |
+| MMLU | 82.0% [73.3–88.3%] | 85.9% [77.8–91.4%] | **104.7%** |
+| TruthfulQA (MC1) | 72.0% [62.5–79.9%] | 73.7% [64.3–81.4%] | **102.4%** |
+| LongBench (HotpotQA) | 57.0% [47.2–66.3%] | 60.4% [50.6–69.4%] | **105.9%** |
 | Berkeley Function Calling | 99.0% [94.5–99.8%] | 100.0% [96.3–100.0%] | **101.0%** |
 
 > Confidence intervals overlap on every one of the 7 benchmarks — accuracy is statistically indistinguishable from baseline. LongBench (the only benchmark where context exceeds the budget) shows a 3.6% token saving with a small retention **gain**. Reproduce: `python -m bench.accuracy --benchmark all --model gpt-4o-mini --samples 100`
