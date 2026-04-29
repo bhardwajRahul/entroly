@@ -476,6 +476,14 @@ class EntrolyEngine:
         self._crystallization_callback: Any = None
         self._crystallized_count: int = 0
 
+        # Fast-path router (set lazily by create_mcp_server). When unset,
+        # _try_fast_path is a no-op.
+        self._fast_path_router: Any = None
+        # Cache for the Rust engine's fragment export, used by the
+        # fast-path's by-id-or-source lookup. Cleared on ingest.
+        self._fragment_cache: dict[str, dict[str, Any]] = {}
+        self._fragment_cache_dirty: bool = True
+
         # ── Per-fragment selection counter ─────────────────────────
         # Drives the "consider pinning" memory nudge (P1.D1). A fragment
         # repeatedly selected across optimizations is a persistence
@@ -560,6 +568,10 @@ class EntrolyEngine:
         # dispatch to prevent unpredictable GC pauses. Manually collect after
         # returning to amortize the cost at a safe boundary.
         gc.disable()
+        # Invalidate the fast-path's fragment cache: the Rust engine has
+        # gained a new fragment, so any cached export_fragments() snapshot
+        # is now stale.
+        self._fragment_cache_dirty = True
         try:
             if self._use_rust:
                 # Enforce max_fragments cap on Rust engine (Rust doesn't enforce it)
@@ -590,6 +602,18 @@ class EntrolyEngine:
         """Select the mathematically optimal subset of context fragments."""
         if token_budget <= 0:
             token_budget = self.config.default_token_budget
+
+        # ── Fast-path: matched crystallized skill bypasses pipeline ─────
+        # When a query matches a previously-crystallized skill (its
+        # Hoeffding LCB beat the global baseline, so the recipe is
+        # statistically validated), we can skip the full knapsack
+        # pipeline and return the recorded recipe directly. The skill
+        # tracks its own fitness; OnlinePrism observation is intentionally
+        # skipped on the fast-path since the skill's exploration phase
+        # is over.
+        fp_result = self._try_fast_path(query, token_budget)
+        if fp_result is not None:
+            return fp_result
 
         # Query refinement: expand vague queries using in-memory file context.
         # This is the key fix for hallucination from incomplete context:
@@ -654,8 +678,24 @@ class EntrolyEngine:
                 selected = result.get("selected_fragments", result.get("selected", []))
                 tokens_used = result.get("tokens_used",
                     sum(f.get("token_count", 0) for f in selected if isinstance(f, dict)))
+                # Bug-fix: when the result dict lacks total_fragments AND
+                # fragment_count (Rust engine path doesn't surface them),
+                # fall back to the engine's live count via the public API.
+                # Prior fallback `max(len(selected), 1)` set select_rate=1.0
+                # always — far from the 0.4 optimum — collapsing reward to
+                # near zero and making crystallization structurally
+                # impossible from organic traffic.
                 total_frags = result.get("total_fragments",
-                    result.get("fragment_count", max(len(selected), 1)))
+                    result.get("fragment_count", None))
+                if total_frags is None:
+                    try:
+                        if self._use_rust:
+                            total_frags = int(self._rust.fragment_count())
+                        else:
+                            total_frags = len(self._fragments)
+                    except Exception:
+                        total_frags = max(len(selected), 1)
+                total_frags = max(total_frags, len(selected), 1)
 
                 reward = compute_implicit_reward(
                     selected_count=len(selected),
@@ -775,6 +815,118 @@ class EntrolyEngine:
             engine.set_crystallization_callback(skill_engine.crystallize_skill)
         """
         self._crystallization_callback = fn
+
+    def set_fast_path_router(self, router: Any) -> None:
+        """Register the fast-path router that bypasses the full pipeline
+        when a query matches a promoted crystallized skill.
+
+        Pass ``None`` to disable. The router is consulted at the top of
+        ``optimize_context`` — a hit short-circuits the knapsack +
+        OnlinePrism pipeline and returns the skill's recipe directly.
+        """
+        self._fast_path_router = router
+
+    def _get_fragment(self, key: str) -> dict[str, Any] | None:
+        """Look up a fragment by id or source.
+
+        Used by the fast-path router to materialize a skill's recipe.
+        Source-based lookup is preferred for stability (fragment IDs
+        change across sessions; source paths persist).
+        """
+        # Python fallback: try id lookup first
+        if not self._use_rust:
+            f = self._fragments.get(key)
+            if f is not None:
+                return {
+                    "id": getattr(f, "fragment_id", key),
+                    "source": getattr(f, "source", ""),
+                    "content": getattr(f, "content", ""),
+                    "token_count": getattr(f, "token_count", 0),
+                    "entropy_score": getattr(f, "entropy_score", 0.0),
+                }
+            # Source lookup
+            for fid, frag in self._fragments.items():
+                if getattr(frag, "source", "") == key:
+                    return {
+                        "id": fid, "source": key,
+                        "content": getattr(frag, "content", ""),
+                        "token_count": getattr(frag, "token_count", 0),
+                        "entropy_score": getattr(frag, "entropy_score", 0.0),
+                    }
+            return None
+        # Rust path: use export_fragments and search. Cache to amortize.
+        if not hasattr(self, "_fragment_cache") or self._fragment_cache_dirty:
+            try:
+                items = list(self._rust.export_fragments())
+            except Exception:
+                items = []
+            cache: dict[str, dict[str, Any]] = {}
+            for it in items:
+                d = dict(it)
+                fid = d.get("id") or d.get("fragment_id") or ""
+                src = d.get("source", "")
+                if fid:
+                    cache[fid] = d
+                if src:
+                    cache[src] = d
+            self._fragment_cache = cache
+            self._fragment_cache_dirty = False
+        return self._fragment_cache.get(key)
+
+    def _try_fast_path(self, query: str, token_budget: int) -> dict[str, Any] | None:
+        """Consult the fast-path router; return a result dict on hit, None otherwise.
+
+        Wraps every error path so a malformed router never breaks
+        optimize_context — the worst case is a silent fall-through to
+        the normal pipeline.
+        """
+        router = getattr(self, "_fast_path_router", None)
+        if router is None:
+            return None
+        try:
+            fp = router.try_match(query, token_budget=token_budget)
+        except Exception as e:
+            logger.debug("fast_path.try_match raised: %s — falling through", e)
+            return None
+        if fp is None:
+            return None
+        # Build a result dict that matches the optimize_context contract
+        # closely enough that downstream consumers (MCP wrappers, sanitizer,
+        # nudge computation) work without modification.
+        return {
+            "selected_fragments": fp.selected_fragments,
+            "selected": fp.selected_fragments,  # alias
+            "tokens_used": sum(
+                int(f.get("token_count", 0) or 0) for f in fp.selected_fragments
+            ),
+            "total_fragments": (
+                self._rust.fragment_count() if self._use_rust
+                else len(self._fragments)
+            ),
+            "fast_path": {
+                "hit": True,
+                "skill_id": fp.skill_id,
+                "cluster_id": fp.cluster_id,
+                "fitness": fp.fitness,
+                "recipe_size": fp.recipe_size,
+                "matched_present": fp.matched_present,
+                "matched_missing": fp.matched_missing,
+                "elapsed_ms": fp.elapsed_ms,
+            },
+            # Provide the empty/zero analogues for fields the downstream
+            # consumer expects, so it doesn't crash on missing keys.
+            "online_prism": {
+                "reward": 0.0, "weights": {},
+                "n": self._online_prism._n, "phase": "fast_path",
+            },
+            "crystallization": self._crystallizer.stats() | {
+                "lifetime_crystallized": self._crystallized_count,
+            },
+            "tokens_saved": 0,
+            "method": "fast_path",
+            "query": query,
+            "token_budget": token_budget,
+        }
 
     def set_journal_callback(self, fn: Any) -> None:
         """Register a callback for implicit-reward FeedbackJournal logging.
@@ -2468,6 +2620,31 @@ def create_mcp_server():
             logger.debug("crystallize_skill error: %s", e)
     engine.set_crystallization_callback(_on_crystallization)
     logger.info("RewardCrystallizer: success-driven skill synthesis wired")
+
+    # ── Wire fast-path router ──────────────────────────────────────
+    # When a query matches a previously-crystallized skill, the router
+    # bypasses the full optimize_context pipeline and returns the
+    # recipe directly. The router caches loaded skills with a TTL and
+    # invalidates on each new crystallization, so newly-promoted
+    # skills are picked up immediately without a restart.
+    try:
+        from .fast_path import FastPathRouter
+        _fast_path = FastPathRouter(
+            skill_lister=_py_skill_engine.list_skills,
+            fragment_lookup=engine._get_fragment,
+        )
+        engine.set_fast_path_router(_fast_path)
+        # Chain crystallization callback to also invalidate fast-path cache.
+        _orig_cryst_cb = engine._crystallization_callback
+        def _on_cryst_with_fp_invalidate(event: Any) -> None:
+            try:
+                _orig_cryst_cb(event)
+            finally:
+                _fast_path.invalidate_cache()
+        engine.set_crystallization_callback(_on_cryst_with_fp_invalidate)
+        logger.info("FastPathRouter: matched-query bypass wired")
+    except Exception as e:
+        logger.debug("FastPathRouter wiring failed (non-fatal): %s", e)
 
     # Wire ComponentFeedbackBus to all self-improving components
     _py_orchestrator._component_bus = _component_bus

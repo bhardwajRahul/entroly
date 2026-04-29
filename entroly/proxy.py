@@ -1248,7 +1248,7 @@ class PromptCompilerProxy:
 
         # Security scan on selected fragments
         security_issues: list[str] = []
-        if self.config.enable_security_scan and self.engine._guard.available:
+        if self.config.enable_security_scan and hasattr(self.engine, '_guard') and self.engine._guard.available:
             for frag in selected:
                 content = frag.get("preview", frag.get("content", ""))
                 source = frag.get("source", "")
@@ -1259,7 +1259,7 @@ class PromptCompilerProxy:
         # LTM memories (already injected by optimize_context, but we want to
         # show them in the context block for transparency)
         ltm_memories: list[dict] = []
-        if self.config.enable_ltm and self.engine._ltm.active:
+        if self.config.enable_ltm and hasattr(self.engine, '_ltm') and self.engine._ltm.active:
             ltm_memories = self.engine._ltm.recall_relevant(
                 user_message, top_k=3, min_retention=0.3
             )
@@ -1543,8 +1543,12 @@ class PromptCompilerProxy:
         with self._stats_lock:
             if self._last_temperature is not None:
                 resp_headers["X-Entroly-Temperature"] = f"{self._last_temperature:.4f}"
-            if self._last_tokens_saved_pct:
-                resp_headers["X-Entroly-Tokens-Saved-Pct"] = f"{self._last_tokens_saved_pct:.1f}"
+            # Use getattr so this is robust to call paths that didn't go
+            # through optimization (and so didn't set the attribute) —
+            # matches the defensive pattern of _last_fragment_count below.
+            tsp = getattr(self, "_last_tokens_saved_pct", None)
+            if tsp:
+                resp_headers["X-Entroly-Tokens-Saved-Pct"] = f"{tsp:.1f}"
             if hasattr(self, '_last_fragment_count'):
                 resp_headers["X-Entroly-Fragments"] = str(getattr(self, '_last_fragment_count', 0))
             if hasattr(self, '_last_confidence'):

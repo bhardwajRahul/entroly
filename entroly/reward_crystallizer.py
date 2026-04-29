@@ -312,6 +312,16 @@ class RewardCrystallizer:
         # ``cluster.n_total`` over active clusters undercounts whenever
         # the LRU evicts a cluster mid-flight; this counter doesn't.
         self._lifetime_observations: int = 0
+        # Sums for *external* baseline computation. Per-cluster external
+        # mean = (global_total_reward − cluster_total_reward) /
+        # (global_total_n − cluster_total_n). Survives LRU eviction by
+        # being a flat counter rather than a per-cluster sum.
+        self._lifetime_reward_sum: float = 0.0
+        # Per-cluster lifetime totals (NOT just window — survives window
+        # eviction so we don't accidentally credit a cluster's old
+        # observations to the external baseline).
+        self._cluster_lifetime_reward: dict[str, float] = {}
+        self._cluster_lifetime_n: dict[str, int] = {}
 
     # ── Observation ───────────────────────────────────────────────
 
@@ -346,12 +356,22 @@ class RewardCrystallizer:
 
         with self._lock:
             self._lifetime_observations += 1
+            self._lifetime_reward_sum += reward
             cluster = self._find_or_create_cluster(qtokens, frag_tuple)
             cluster.queries.append(query)
             cluster.window.append(obs)
             while len(cluster.window) > self._window:
                 cluster.window.popleft()
             cluster.n_total += 1
+
+            # Per-cluster lifetime totals for external-baseline math.
+            cid = cluster.cluster_id
+            self._cluster_lifetime_reward[cid] = (
+                self._cluster_lifetime_reward.get(cid, 0.0) + reward
+            )
+            self._cluster_lifetime_n[cid] = (
+                self._cluster_lifetime_n.get(cid, 0) + 1
+            )
 
             event = self._maybe_crystallize(cluster, baseline_reward)
             if event is not None:
@@ -458,7 +478,31 @@ class RewardCrystallizer:
         mean_r = sum(rewards) / n
         lcb = _hoeffding_lcb(mean_r, n, self._delta)
 
-        if lcb <= baseline + self._epsilon:
+        # ── External baseline (excludes this cluster's contributions) ──
+        # The caller's ``baseline`` is typically a global reward-EMA that
+        # tracks ALL observations, including this cluster's. For sustained
+        # high-reward clusters that's a structural false-negative: as the
+        # cluster fills the EMA, baseline asymptotes to cluster_mean and
+        # the LCB never beats it. Math:
+        #
+        #   ext_n   = lifetime_obs   − cluster_lifetime_obs
+        #   ext_sum = lifetime_∑r    − cluster_lifetime_∑r
+        #   baseline_ext = ext_sum / ext_n   if ext_n ≥ 5
+        #                = baseline (caller's value)   otherwise
+        #
+        # The 5-observation floor is a Hoeffding-symmetric choice: we
+        # require enough non-cluster signal that the external mean is at
+        # least as well-resolved as the cluster's LCB.
+        c_lifetime_n = self._cluster_lifetime_n.get(cluster.cluster_id, 0)
+        c_lifetime_r = self._cluster_lifetime_reward.get(cluster.cluster_id, 0.0)
+        ext_n = self._lifetime_observations - c_lifetime_n
+        ext_sum = self._lifetime_reward_sum - c_lifetime_r
+        if ext_n >= 5:
+            effective_baseline = ext_sum / ext_n
+        else:
+            effective_baseline = baseline  # cold-start fallback
+
+        if lcb <= effective_baseline + self._epsilon:
             return None
 
         cluster.last_crystallized_at_n = cluster.n_total
@@ -479,8 +523,8 @@ class RewardCrystallizer:
             n_samples=n,
             mean_reward=mean_r,
             lcb_reward=lcb,
-            baseline_reward=baseline,
-            effect_size=lcb - baseline,
+            baseline_reward=effective_baseline,
+            effect_size=lcb - effective_baseline,
             created_at=time.time(),
         )
 

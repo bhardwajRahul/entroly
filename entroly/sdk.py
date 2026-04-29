@@ -249,11 +249,23 @@ def _looks_like_code(text: str) -> bool:
 
 
 def _compress_code(content: str, target_ratio: float) -> str:
-    """Compress code using the Rust engine if available."""
+    """Compress code using the Rust engine if available.
+
+    Bug-fix history: prior versions ignored target_ratio (Rust path passed
+    the full token count as the budget, and the fallback miscategorised
+    code as "prose" for universal_compress). Both honored ratio in name
+    only — the function silently no-op'd on inputs the engine considered
+    already-skeletal. The fix below honors the requested ratio in both
+    paths.
+    """
+    target_tokens = max(50, int((len(content) // 4) * target_ratio))
     try:
         from entroly_core import py_compress_block
-        return py_compress_block("assistant", content, len(content) // 4, "skeleton", None)
+        return py_compress_block(
+            "assistant", content, target_tokens, "skeleton", None,
+        )
     except ImportError:
-        # Rust engine not available — use universal compressor
-        compressed, _, _ = universal_compress(content, target_ratio, "prose")
+        # Rust engine not available — use universal compressor with the
+        # correct content_type so it picks the code-specific compactor.
+        compressed, _, _ = universal_compress(content, target_ratio, "code")
         return compressed
