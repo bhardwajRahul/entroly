@@ -108,7 +108,7 @@ def generate_report(
         A deterministic dict suitable for ``json.dumps(sort_keys=True)``.
         Same input always produces byte-stable JSON output.
     """
-    log = AppendOnlyEventLog(log_path)
+
 
     # ── Phase 1: Parse and partition ──────────────────────────────────
     traces: dict[str, dict[str, Any]] = {}

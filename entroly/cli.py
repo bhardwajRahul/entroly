@@ -2918,7 +2918,7 @@ def cmd_ravs(args):
     ravs_action = getattr(args, "ravs_action", None)
     if ravs_action != "report":
         print(f"  {C.YELLOW}Unknown ravs action: {ravs_action}{C.RESET}")
-        print(f"  Usage: entroly ravs report [--log PATH] [--format json] [--since 7d] [--include-weak]")
+        print("  Usage: entroly ravs report [--log PATH] [--format json] [--since 7d] [--include-weak]")
         return
 
     # Resolve log path

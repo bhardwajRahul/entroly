@@ -138,8 +138,7 @@ def compute_gate_status(
     decomp_rate = report.get("decomposition_evidence_rate", 0.0)
     success_rate = report.get("success_rate", 0.0)
 
-    # Count executor coverage from decomposition data
-    decomp_count = report.get("decomposition_evidence_count", 0)
+
 
     # Model readiness: only models with enough data
     model_ready: dict[str, bool] = {}
