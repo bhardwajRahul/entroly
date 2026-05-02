@@ -23,6 +23,7 @@ Commands:
     entroly migrate     Auto-migrate config/index to current version
     entroly role        Role-based weight presets (frontend/backend/sre/data)
     entroly completions Generate shell completion scripts
+    entroly ravs        RAVS offline evaluation (report)
 """
 
 from __future__ import annotations
@@ -2899,6 +2900,85 @@ def cmd_finetune(args):
     print(f"  {C.GRAY}Use with: openai api fine_tuning.jobs.create -t {output}{C.RESET}\n")
 
 
+def cmd_ravs(args):
+    """entroly ravs — RAVS v1 offline evaluation tools.
+
+    Subcommands:
+      report  Read the JSONL event log, recompute labels from outcome events,
+              and print the primary evaluation report. Same input log always
+              produces byte-stable JSON output. Malformed lines are counted
+              and skipped, not fatal. Empty logs produce a valid zero report.
+              Weak labels only affect metrics with --include-weak. Shadow
+              metrics are labeled as estimates/agreement, not regret truth.
+    """
+    import time as _time
+
+    from entroly.ravs.report import generate_report, format_report_text
+
+    ravs_action = getattr(args, "ravs_action", None)
+    if ravs_action != "report":
+        print(f"  {C.YELLOW}Unknown ravs action: {ravs_action}{C.RESET}")
+        print(f"  Usage: entroly ravs report [--log PATH] [--format json] [--since 7d] [--include-weak]")
+        return
+
+    # Resolve log path
+    log_path = getattr(args, "log", None)
+    if not log_path:
+        log_path = str(Path.home() / ".entroly" / "ravs" / "events.jsonl")
+
+    # Parse --since
+    since_ts: float | None = None
+    since_raw = getattr(args, "since", None)
+    if since_raw:
+        since_raw = since_raw.strip().lower()
+        now = _time.time()
+        if since_raw.endswith("d"):
+            try:
+                days = float(since_raw[:-1])
+                since_ts = now - (days * 86400)
+            except ValueError:
+                print(f"  {C.RED}Invalid --since value: {since_raw} (use e.g. 7d, 30d){C.RESET}")
+                return
+        elif since_raw.endswith("h"):
+            try:
+                hours = float(since_raw[:-1])
+                since_ts = now - (hours * 3600)
+            except ValueError:
+                print(f"  {C.RED}Invalid --since value: {since_raw} (use e.g. 24h, 48h){C.RESET}")
+                return
+        else:
+            try:
+                since_ts = float(since_raw)
+            except ValueError:
+                print(f"  {C.RED}Invalid --since value: {since_raw} (use e.g. 7d, 24h, or a Unix timestamp){C.RESET}")
+                return
+
+    include_weak = getattr(args, "include_weak", False)
+    output_format = getattr(args, "format", "text")
+
+    # Check log exists
+    if not Path(log_path).exists():
+        if output_format == "json":
+            report = generate_report(log_path, include_weak=include_weak, since_timestamp=since_ts)
+            print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+        else:
+            print(f"\n  {C.YELLOW}No RAVS event log found at: {log_path}{C.RESET}")
+            print(f"  {C.GRAY}Events are logged automatically when the proxy or MCP server")
+            print(f"  processes requests. Start a session first, then re-run this report.{C.RESET}\n")
+            # Still produce a valid zero report
+            report = generate_report(log_path, include_weak=include_weak, since_timestamp=since_ts)
+            print(format_report_text(report))
+        return
+
+    # Generate report
+    report = generate_report(log_path, include_weak=include_weak, since_timestamp=since_ts)
+
+    if output_format == "json":
+        print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(format_report_text(report))
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -3356,6 +3436,33 @@ def main():
         help="Output file path (default: training_data.jsonl)",
     )
 
+    # entroly ravs
+    ravs_parser = subparsers.add_parser(
+        "ravs",
+        help="RAVS v1 offline evaluation tools",
+    )
+    ravs_subparsers = ravs_parser.add_subparsers(dest="ravs_action")
+    ravs_report_parser = ravs_subparsers.add_parser(
+        "report",
+        help="Generate offline evaluation report from RAVS event log",
+    )
+    ravs_report_parser.add_argument(
+        "--log", type=str, default=None,
+        help="Path to RAVS event JSONL log (default: ~/.entroly/ravs/events.jsonl)",
+    )
+    ravs_report_parser.add_argument(
+        "--format", type=str, choices=["text", "json"], default="text",
+        help="Output format: text (human-readable) or json (byte-stable)",
+    )
+    ravs_report_parser.add_argument(
+        "--since", type=str, default=None,
+        help="Only include traces since this time (e.g. 7d, 24h, or Unix timestamp)",
+    )
+    ravs_report_parser.add_argument(
+        "--include-weak", action="store_true",
+        help="Include weak (agent self-report) signals in headline metrics",
+    )
+
     args = parser.parse_args()
 
     # First-run welcome + update check (non-blocking)
@@ -3398,6 +3505,7 @@ def main():
         "wrap": cmd_wrap,
         "learn": cmd_learn,
         "share": cmd_share,
+        "ravs": cmd_ravs,
     }
 
     handler = _dispatch.get(args.command)

@@ -796,6 +796,8 @@ class EntrolyEngine:
 
                 result["online_prism"] = {
                     "reward": round(reward, 4),
+                    "implicit_advantage": round(reward - pre_baseline, 4),
+                    "contributions": {k: round(v, 4) for k, v in contributions.items()},
                     "weights": {k: round(v, 4) for k, v in new_weights.items()},
                     "n": self._online_prism._n,
                     "phase": self._online_prism.stats()["phase"],
@@ -1614,6 +1616,72 @@ def create_mcp_server():
     # not just rare explicit record_outcome MCP calls.
     engine.set_journal_callback(_feedback_journal.log)
 
+    # ── RAVS v1: append-only event log + helpers ─────────────────────
+    # Path lives under the same checkpoint dir so a project's RAVS data
+    # follows the project. Lazy-imported so an entroly install without
+    # the ravs subpackage (older wheels) still loads server.py.
+    from .ravs.events import (
+        AppendOnlyEventLog as _RAVS_AppendOnlyEventLog,
+        OutcomeEvent as _RAVS_OutcomeEvent,
+    )
+    from .ravs.outcome_bridge import OutcomeBridge as _RAVS_OutcomeBridge
+    from .ravs.shadow_runner import ShadowRunner as _RAVS_ShadowRunner
+    from .ravs.router import GuardedRouter as _RAVS_GuardedRouter, compute_gate_status as _ravs_compute_gate
+    _ravs_log_singleton: list = [None]  # nullable container so closure can mutate
+    _ravs_bridge_singleton: list = [None]
+    _ravs_shadow_singleton: list = [None]
+    _ravs_router_singleton: list = [None]
+
+    def _get_ravs_log() -> "_RAVS_AppendOnlyEventLog | None":
+        """Lazy singleton — initializes on first call, never re-creates.
+
+        Returns None on init failure (disk full, perms, etc.) so the
+        caller can degrade gracefully. RAVS instrumentation is a
+        side-channel: it must never break a request.
+        """
+        if _ravs_log_singleton[0] is not None:
+            return _ravs_log_singleton[0]
+        try:
+            log_path = os.path.join(_checkpoint_dir, "ravs", "events.jsonl")
+            _ravs_log_singleton[0] = _RAVS_AppendOnlyEventLog(log_path)
+        except Exception as e:
+            logger.debug("RAVS event log init failed (degrading silently): %s", e)
+            return None
+        return _ravs_log_singleton[0]
+
+    def _get_ravs_bridge() -> "_RAVS_OutcomeBridge | None":
+        """Lazy singleton for the RAVS → PRISM outcome bridge."""
+        if _ravs_bridge_singleton[0] is not None:
+            return _ravs_bridge_singleton[0]
+        try:
+            _ravs_bridge_singleton[0] = _RAVS_OutcomeBridge(engine._online_prism)
+        except Exception as e:
+            logger.debug("RAVS outcome bridge init failed: %s", e)
+            return None
+        return _ravs_bridge_singleton[0]
+
+    def _get_ravs_shadow() -> "_RAVS_ShadowRunner | None":
+        """Lazy singleton for the RAVS v2 shadow compiler/runner."""
+        if _ravs_shadow_singleton[0] is not None:
+            return _ravs_shadow_singleton[0]
+        try:
+            _ravs_shadow_singleton[0] = _RAVS_ShadowRunner()
+        except Exception as e:
+            logger.debug("RAVS shadow runner init failed: %s", e)
+            return None
+        return _ravs_shadow_singleton[0]
+
+    def _get_ravs_router() -> "_RAVS_GuardedRouter | None":
+        """Lazy singleton for the RAVS v3 guarded router."""
+        if _ravs_router_singleton[0] is not None:
+            return _ravs_router_singleton[0]
+        try:
+            _ravs_router_singleton[0] = _RAVS_GuardedRouter()
+        except Exception as e:
+            logger.debug("RAVS router init failed: %s", e)
+            return None
+        return _ravs_router_singleton[0]
+
     @mcp.tool()
     def remember_fragment(
         content: str,
@@ -1765,7 +1833,10 @@ def create_mcp_server():
                 pass  # Never fail the optimization for tracking
 
         # Capture optimization context for feedback attribution
+        import uuid as _uuid
+        _opt_request_id = _uuid.uuid4().hex
         _last_opt_ctx = {
+            "request_id": _opt_request_id,
             "weights": {
                 "w_r": _config.weight_recency, "w_f": _config.weight_frequency,
                 "w_s": _config.weight_semantic_sim, "w_e": _config.weight_entropy,
@@ -1775,7 +1846,92 @@ def create_mcp_server():
             "turn": engine._turn_counter,
             "task_type": task_type,
         }
+        result["request_id"] = _opt_request_id
         result["_task_profile"] = {"task_type": task_type, "confidence": task_confidence}
+
+        # ── RAVS → PRISM bridge: cache observation for honest correction ──
+        try:
+            _bridge = _get_ravs_bridge()
+            prism_data = result.get("online_prism", {})
+            if _bridge is not None and prism_data:
+                _bridge.cache_observation(
+                    request_id=_opt_request_id,
+                    implicit_reward=prism_data.get("reward", 0.5),
+                    implicit_advantage=prism_data.get("implicit_advantage", 0.0),
+                    contributions=prism_data.get("contributions", {}),
+                    weights=prism_data.get("weights", {}),
+                )
+        except Exception as _bridge_err:
+            logger.debug("RAVS bridge cache_observation skipped: %s", _bridge_err)
+
+        # ── RAVS v2: shadow compile + run ─────────────────────────────
+        # Decompose the query into typed nodes, execute each node's
+        # cheap executor in shadow, record metrics. Never touches
+        # production output. Writes DecompositionEvidence to V1 log.
+        try:
+            _shadow = _get_ravs_shadow()
+            if _shadow is not None and query:
+                _shadow_plan = _shadow.compile_and_run(
+                    query,
+                    request_id=_opt_request_id,
+                    model=result.get("model", ""),
+                )
+                # Surface shadow metrics in result (observability only)
+                result["ravs_shadow"] = {
+                    "total_nodes": _shadow_plan.total_nodes,
+                    "decomposed_nodes": _shadow_plan.decomposed_nodes,
+                    "executor_successes": _shadow_plan.executor_success_count,
+                    "verifier_passes": _shadow_plan.verifier_pass_count,
+                    "fallback_count": _shadow_plan.fallback_count,
+                    "estimated_cost_usd": _shadow_plan.estimated_total_cost_usd,
+                    "baseline_cost_usd": _shadow_plan.baseline_total_cost_usd,
+                }
+                # Write decomposition evidence to V1 event log
+                _ravs_log = _get_ravs_log()
+                if _ravs_log is not None and _shadow_plan.decomposed_nodes > 0:
+                    from .ravs.events import TraceEvent as _RAVS_TraceEvent
+                    decomp_evidence = [
+                        {"kind": n.kind, "source": "shadow_compiler",
+                         "executor": n.executor, "confidence": round(n.confidence, 2)}
+                        for n in _shadow_plan.nodes
+                        if n.kind != "model_bound"
+                    ]
+                    _ravs_log.write_trace(_RAVS_TraceEvent(
+                        request_id=_opt_request_id,
+                        model=result.get("model", ""),
+                        cost_usd=-1.0,
+                        latency_ms=-1.0,
+                        context_size_tokens=result.get("tokens_used", 0),
+                        retrieved_fragments=[],
+                        decomposition_evidence=decomp_evidence,
+                        shadow_recommendations={},
+                    ))
+        except Exception as _shadow_err:
+            logger.debug("RAVS shadow runner skipped: %s", _shadow_err)
+
+        # ── RAVS v3: guarded routing decision (observability only) ──
+        # The router makes a fast O(1) decision about whether this
+        # request could use a cheaper model. The decision is logged
+        # but NEVER acted on unless routing is explicitly enabled.
+        try:
+            _router = _get_ravs_router()
+            if _router is not None and query:
+                _has_decomp = result.get("ravs_shadow", {}).get("decomposed_nodes", 0) > 0
+                _rdecision = _router.route(
+                    query,
+                    result.get("model", ""),
+                    has_decomposed_nodes=_has_decomp,
+                )
+                result["ravs_routing"] = {
+                    "use_original": _rdecision.use_original,
+                    "recommended_model": _rdecision.recommended_model,
+                    "reason": _rdecision.reason,
+                    "risk_level": _rdecision.risk_level,
+                    "confidence": _rdecision.confidence,
+                    "decision_time_ms": _rdecision.decision_time_ms,
+                }
+        except Exception as _router_err:
+            logger.debug("RAVS router skipped: %s", _router_err)
 
         # ── Feed evolution loop on low sufficiency ─────────────────
         # If the optimizer couldn't find good context, record a miss
@@ -1892,6 +2048,14 @@ def create_mcp_server():
         Args:
             fragment_ids: Comma-separated fragment IDs
             success: True if output was good, False if bad
+
+        NOTE on RAVS v1: this tool's success flag is also recorded into
+        the RAVS event log as an ``agent_self_report`` event with
+        ``strength=weak`` and ``include_in_default_training=False``.
+        Default labeling rules ignore it. Use the structured
+        ``record_test_result`` / ``record_command_exit`` /
+        ``record_ci_result`` tools for honest signals you want offline
+        evaluation to actually train against.
         """
         ids = [fid.strip() for fid in fragment_ids.split(",") if fid.strip()]
         if success:
@@ -1913,11 +2077,173 @@ def create_mcp_server():
             if _feedback_journal.count() % 5 == 0:
                 _task_profiles.optimize_all()
 
+        # ── RAVS legacy bridge ────────────────────────────────────
+        # Always record, but as WEAK strength with the agent_self_report
+        # event_type. The default reducer rule excludes weak signals;
+        # only the explicit "legacy" rule includes them. This preserves
+        # back-compat for existing automation (the engine still updates
+        # its internal RL state from the boolean) while denying the
+        # agent's self-report any influence on what RAVS treats as
+        # ground truth.
+        try:
+            _ravs_log = _get_ravs_log()
+            if _ravs_log is not None and _last_opt_ctx:
+                _ravs_log.write_outcome(_RAVS_OutcomeEvent(
+                    request_id=str(_last_opt_ctx.get("request_id", "") or ""),
+                    event_type="agent_self_report",
+                    value="success" if success else "failure",
+                    strength="weak",
+                    source="mcp_record_outcome_legacy",
+                    include_in_default_training=False,
+                    metadata={"fragment_ids": ids},
+                ))
+        except Exception as _ravs_err:
+            logger.debug("RAVS legacy bridge skipped: %s", _ravs_err)
+
         return json.dumps({
             "status": "recorded",
             "fragment_ids": ids,
             "outcome": "success" if success else "failure",
         }, indent=2)
+
+    # ── RAVS v1: structured honest-signal entry points ────────────────
+    # Each of these records a STRONG event that the default reducer
+    # rule will count toward training. Unlike record_outcome (which is
+    # the agent reporting on itself), these tools are meant to be
+    # called when an external check actually happened.
+
+    def _record_honest(
+        request_id: str,
+        event_type: str,
+        value: str,
+        source: str,
+        metadata: dict | None = None,
+        strength: str = "strong",
+    ) -> str:
+        log = _get_ravs_log()
+        if log is None:
+            return json.dumps({"status": "skipped",
+                              "reason": "RAVS event log unavailable"})
+        try:
+            log.write_outcome(_RAVS_OutcomeEvent(
+                request_id=request_id,
+                event_type=event_type,
+                value=value,
+                strength=strength,
+                source=source,
+                include_in_default_training=True,
+                metadata=metadata or {},
+            ))
+        except Exception as e:
+            return json.dumps({"status": "error", "reason": str(e)[:200]})
+
+        # ── RAVS → PRISM bridge: apply honest correction ──────────
+        bridge_result = None
+        try:
+            _bridge = _get_ravs_bridge()
+            if _bridge is not None:
+                bridge_result = _bridge.on_honest_outcome(
+                    request_id=request_id,
+                    event_type=event_type,
+                    value=value,
+                    strength=strength,
+                )
+        except Exception as _bridge_err:
+            logger.debug("RAVS bridge on_honest_outcome skipped: %s", _bridge_err)
+
+        resp = {
+            "status": "recorded",
+            "request_id": request_id,
+            "event_type": event_type,
+            "value": value,
+            "strength": strength,
+        }
+        if bridge_result is not None:
+            resp["prism_correction"] = {
+                "applied": True,
+                "delta_advantage": bridge_result.get("delta_advantage", 0),
+                "honest_reward": bridge_result.get("honest_reward", 0),
+                "implicit_reward": bridge_result.get("implicit_reward", 0),
+            }
+        return json.dumps(resp)
+
+    @mcp.tool()
+    def record_test_result(
+        request_id: str,
+        passed: bool,
+        suite: str = "",
+        details: str = "",
+    ) -> str:
+        """Record that tests RAN and either passed or failed for a request.
+
+        This is a STRONG signal — distinct from record_outcome which is
+        the agent's self-report. Call this when actual test execution
+        produced a real pass/fail outcome.
+
+        Args:
+            request_id: the trace_id from the optimize_context call
+            passed: True if all tests passed, False if any failed
+            suite: optional name of the test suite (e.g. "pytest", "cargo test")
+            details: optional short summary of what was tested
+        """
+        return _record_honest(
+            request_id=request_id,
+            event_type="test_result",
+            value="passed" if passed else "failed",
+            source="mcp_record_test_result",
+            metadata={"suite": suite[:120], "details": details[:500]},
+        )
+
+    @mcp.tool()
+    def record_command_exit(
+        request_id: str,
+        exit_code: int,
+        command: str = "",
+    ) -> str:
+        """Record the exit code of a command that was generated and executed.
+
+        STRONG signal: a real subprocess produced a real exit code.
+        Convention: exit_code == 0 → "success", anything else → "failure".
+
+        Args:
+            request_id: the trace_id from the optimize_context call
+            exit_code: subprocess exit code; 0 = success
+            command: optional short representation of what was run
+        """
+        return _record_honest(
+            request_id=request_id,
+            event_type="command_exit",
+            value="success" if exit_code == 0 else "failure",
+            source="mcp_record_command_exit",
+            metadata={"exit_code": int(exit_code), "command": command[:240]},
+        )
+
+    @mcp.tool()
+    def record_ci_result(
+        request_id: str,
+        passed: bool,
+        pipeline: str = "",
+        url: str = "",
+    ) -> str:
+        """Record CI pipeline pass/fail status for a request.
+
+        STRONG signal: CI is independent infrastructure that ran the
+        change and produced a verdict. The honest top of the signal
+        hierarchy.
+
+        Args:
+            request_id: the trace_id from the optimize_context call
+            passed: True if CI green, False if any required check failed
+            pipeline: e.g. "github_actions", "gitlab_ci", "buildkite"
+            url: optional link to the CI run
+        """
+        return _record_honest(
+            request_id=request_id,
+            event_type="ci_result",
+            value="passed" if passed else "failed",
+            source="mcp_record_ci_result",
+            metadata={"pipeline": pipeline[:80], "url": url[:240]},
+        )
 
     @mcp.tool()
     def explain_context() -> str:
