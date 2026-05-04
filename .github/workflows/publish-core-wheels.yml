@@ -95,4 +95,6 @@ jobs:
         with:
           packages-dir: dist/
           skip-existing: true
-          password: ${{ secrets.PYPI_CORE_TOKEN }}
+          # Authenticated via PyPI Trusted Publishers (OIDC) — no token needed.
+          # Configure at:
+          # https://pypi.org/manage/project/entroly-core/settings/publishing/
