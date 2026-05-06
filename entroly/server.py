@@ -714,6 +714,28 @@ class EntrolyEngine:
                         total_frags = max(len(selected), 1)
                 total_frags = max(total_frags, len(selected), 1)
 
+                # ── Record features for the RL pruner ──────────────────
+                # For each selected fragment, capture scoring features so
+                # that a later record_success/failure call can perform the
+                # REINFORCE gradient step.  Without this, apply_feedback
+                # has no feature record and silently drops every signal.
+                try:
+                    for frag in (selected if isinstance(selected, list) else []):
+                        if not isinstance(frag, dict):
+                            continue
+                        fid = str(frag.get("id") or frag.get("fragment_id") or "")
+                        if not fid:
+                            continue
+                        self._pruner.record_fragment_features(
+                            fragment_id=fid,
+                            recency=float(frag.get("recency_score", frag.get("recency", 0.5))),
+                            relevance=float(frag.get("relevance_score", frag.get("relevance", 0.5))),
+                            complexity=float(frag.get("complexity", frag.get("token_count", 100)) / 500.0),
+                            was_selected=True,
+                        )
+                except Exception:
+                    pass  # Best-effort; never break optimize_context
+
                 reward = compute_implicit_reward(
                     selected_count=len(selected),
                     total_fragments=total_frags,

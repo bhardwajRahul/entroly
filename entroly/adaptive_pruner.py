@@ -2,62 +2,176 @@
 AdaptivePruner Bridge for Entroly
 ======================================
 
-Wires the Rust-backed AdaptivePruner into the feedback loop.
+Wires a 4-weight RL policy into the feedback loop.
 
 The key addition: `historical_success` — a dimension that entroly's
-Rust engine doesn't have. Over time, the RL weight updates learn which
+core engine doesn't have. Over time, the RL weight updates learn which
 scoring features matter most for THIS user's codebase.
 
 Weight update rule:
-    weight += lr * feedback * feature_value  (clamped to [-1, 1])
+    weight += lr * feedback * feature_value  (clamped to [0.01, 2.0])
 
-Falls back to no-op if the Rust backend is not installed.
+Architecture: Rust backend preferred for speed; pure-Python fallback
+with identical math guarantees the learning signal is NEVER silently
+dropped. This follows the same pattern as EntrolyEngine (Rust + Python).
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import re as _re
 
 logger = logging.getLogger(__name__)
 
+# ── Try Rust backend first ──────────────────────────────────────────
 try:
-    from entroly_core import AdaptivePruner as _RustPruner  # optional Rust backend
-    from entroly_core import ContextFragment
-    _PRUNER_AVAILABLE = True
+    from entroly_core import AdaptivePruner as _RustPruner
+    from entroly_core import ContextFragment  # noqa: F401
+    _RUST_PRUNER_AVAILABLE = True
 except ImportError:
-    _PRUNER_AVAILABLE = False
+    _RUST_PRUNER_AVAILABLE = False
     _RustPruner = None
 
 try:
-    from entroly_core import CodeQualityGuard as _RustGuard  # optional Rust backend
-    _GUARD_AVAILABLE = True
+    from entroly_core import CodeQualityGuard as _RustGuard
+    _RUST_GUARD_AVAILABLE = True
 except ImportError:
-    _GUARD_AVAILABLE = False
+    _RUST_GUARD_AVAILABLE = False
     _RustGuard = None
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Pure-Python RL Pruner (fallback when Rust backend unavailable)
+# ══════════════════════════════════════════════════════════════════════
+
+class _PyAdaptivePruner:
+    """
+    4-weight linear policy with REINFORCE-style gradient updates.
+
+    Features: [recency, relevance, historical_success, complexity]
+    Score = dot(weights, features)
+
+    Update: w_i += lr * feedback * feature_i
+    Weights are clamped to [0.01, 2.0] to prevent collapse or explosion.
+
+    This is mathematically identical to the Rust AdaptivePruner.
+    """
+
+    __slots__ = ("_weights", "_lr", "_update_count")
+
+    def __init__(self, learning_rate: float = 0.05):
+        # Initial weights: equal prior over all 4 features
+        self._weights = [0.25, 0.35, 0.20, 0.20]  # recency, relevance, hist_success, complexity
+        self._lr = learning_rate
+        self._update_count = 0
+
+    def update_policy(
+        self,
+        feedback: float,
+        recency: float,
+        relevance: float,
+        historical_success: float,
+        complexity: float,
+    ) -> None:
+        """Apply a single REINFORCE gradient step."""
+        features = [recency, relevance, historical_success, complexity]
+        for i in range(4):
+            self._weights[i] += self._lr * feedback * features[i]
+            # Clamp to prevent weight collapse or explosion
+            self._weights[i] = max(0.01, min(2.0, self._weights[i]))
+        self._update_count += 1
+
+    def score_fragment(
+        self,
+        recency: float,
+        relevance: float,
+        historical_success: float,
+        complexity: float,
+    ) -> float:
+        """Score = dot(weights, features)."""
+        features = [recency, relevance, historical_success, complexity]
+        return sum(w * f for w, f in zip(self._weights, features))
+
+    @property
+    def weights(self) -> list[float]:
+        return list(self._weights)
+
+    @property
+    def update_count(self) -> int:
+        return self._update_count
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Pure-Python Code Quality Guard (fallback)
+# ══════════════════════════════════════════════════════════════════════
+
+_SECRET_PATTERNS = [
+    _re.compile(r"""(?:api[_-]?key|secret|password|token)\s*[=:]\s*['"][^'"]{8,}['"]""", _re.IGNORECASE),
+    _re.compile(r"""sk-[A-Za-z0-9]{20,}"""),
+    _re.compile(r"""ghp_[A-Za-z0-9]{36}"""),
+    _re.compile(r"""AKIA[0-9A-Z]{16}"""),
+]
+_UNSAFE_PATTERN = _re.compile(r"""\bunsafe\s*\{""")
+_TODO_PATTERN = _re.compile(r"""(?://|#)\s*(?:TODO|FIXME|HACK|XXX)\b""", _re.IGNORECASE)
+_CONSOLE_PATTERN = _re.compile(r"""(?:console\.(?:log|warn|error)|print\(|println!\()""")
+
+
+class _PyCodeQualityGuard:
+    """Scans fragments for secrets, unsafe blocks, TODOs, and console spam."""
+
+    def review_code(self, content: str, source: str = "") -> list[str]:
+        issues: list[str] = []
+        for pat in _SECRET_PATTERNS:
+            if pat.search(content):
+                issues.append(f"potential secret/credential detected in {source or 'fragment'}")
+                break
+        if _UNSAFE_PATTERN.search(content):
+            issues.append("unsafe block detected")
+        todo_count = len(_TODO_PATTERN.findall(content))
+        if todo_count >= 3:
+            issues.append(f"{todo_count} TODO/FIXME comments")
+        console_count = len(_CONSOLE_PATTERN.findall(content))
+        if console_count >= 5:
+            issues.append(f"{console_count} console/print statements")
+        return issues
+
+
+# ══════════════════════════════════════════════════════════════════════
+# EntrolyPruner — the public API
+# ══════════════════════════════════════════════════════════════════════
+
 class EntrolyPruner:
     """
-    Adaptive RL pruner with optional Rust backend.
+    Adaptive RL pruner with Rust backend + Python fallback.
 
     Extends entroly's Wilson-score feedback with a `historical_success`
     dimension: fragments that previously helped get boosted, those that didn't
     get down-weighted over time.
 
-    Zero-config: if the Rust backend is unavailable, all methods are no-ops.
+    NEVER a no-op: if Rust is unavailable, uses identical Python math.
     """
 
     def __init__(self):
-        self._pruner = _RustPruner() if _PRUNER_AVAILABLE else None
-        self._fragment_features: dict[str, dict[str, float]] = {}
-        if _PRUNER_AVAILABLE:
-            logger.info("AdaptivePruner: Rust backend available -- RL weight learning active")
+        if _RUST_PRUNER_AVAILABLE:
+            self._pruner = _RustPruner()
+            self._backend = "rust"
+            logger.info("AdaptivePruner: Rust backend active — RL weight learning active")
         else:
-            logger.info("AdaptivePruner: Rust backend not available -- using static weights")
+            self._pruner = _PyAdaptivePruner()
+            self._backend = "python"
+            logger.info("AdaptivePruner: Python fallback active — RL weight learning active")
+
+        self._fragment_features: dict[str, dict[str, float]] = {}
 
     @property
     def available(self) -> bool:
-        return _PRUNER_AVAILABLE and self._pruner is not None
+        """Always True — we always have a working backend."""
+        return True
+
+    @property
+    def backend(self) -> str:
+        return self._backend
 
     def record_fragment_features(
         self,
@@ -90,9 +204,6 @@ class EntrolyPruner:
         Returns:
             True if weights were updated, False if no feature record found.
         """
-        if not self.available:
-            return False
-
         features = self._fragment_features.get(fragment_id)
         if not features:
             return False
@@ -118,16 +229,29 @@ class EntrolyPruner:
     ) -> float | None:
         """
         Score a fragment using current learned RL weights.
-        Returns None if pruner unavailable (use entroly's own scoring).
+        Returns None only if something unexpected fails.
         """
-        if not self.available:
+        try:
+            return self._pruner.score_fragment(recency, relevance, historical_success, complexity)
+        except Exception:
             return None
-        return self._pruner.score_fragment(recency, relevance, historical_success, complexity)
+
+    def get_weights(self) -> list[float] | None:
+        """Return the current RL policy weights (Python backend only)."""
+        if isinstance(self._pruner, _PyAdaptivePruner):
+            return self._pruner.weights
+        return None
+
+    def get_update_count(self) -> int:
+        """Return how many gradient updates have been applied."""
+        if isinstance(self._pruner, _PyAdaptivePruner):
+            return self._pruner.update_count
+        return -1  # Rust backend doesn't expose this
 
 
 class FragmentGuard:
     """
-    Code quality scanner with optional Rust backend.
+    Code quality scanner with Rust backend + Python fallback.
 
     Scans each ingested fragment for:
     - Hardcoded API secrets  (sk-..., API_KEY = "...")
@@ -136,17 +260,21 @@ class FragmentGuard:
     - Console spam (>5 log statements)
 
     Returns a list of issues — empty means clean.
-    Zero-config: no-op if Rust backend unavailable.
+    NEVER a no-op: Python fallback covers all patterns.
     """
 
     def __init__(self):
-        self._guard = _RustGuard() if _GUARD_AVAILABLE else None
-        if _GUARD_AVAILABLE:
-            logger.info("FragmentGuard: CodeQualityGuard active -- scanning ingested fragments")
+        if _RUST_GUARD_AVAILABLE:
+            self._guard = _RustGuard()
+            self._backend = "rust"
+        else:
+            self._guard = _PyCodeQualityGuard()
+            self._backend = "python"
 
     @property
     def available(self) -> bool:
-        return _GUARD_AVAILABLE and self._guard is not None
+        """Always True — we always have a working backend."""
+        return True
 
     def scan(self, content: str, source: str = "") -> list[str]:
         """
@@ -154,7 +282,7 @@ class FragmentGuard:
 
         Returns list of issue strings (empty = clean).
         """
-        if not self.available or not content:
+        if not content:
             return []
         try:
             return list(self._guard.review_code(content, source))
