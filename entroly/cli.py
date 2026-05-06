@@ -503,6 +503,13 @@ def cmd_dashboard(args):
     print(f"  {C.GRAY}Showing: tokens saved, PRISM weights, health grade, SAST, dep graph, knapsack decisions{C.RESET}")
     print(f"  {C.GRAY}Press Ctrl+C to stop{C.RESET}\n")
 
+    # Auto-open in browser
+    try:
+        import webbrowser
+        webbrowser.open(f"http://localhost:{args.port}")
+    except Exception:
+        pass
+
     try:
         import time
         while True:
@@ -740,6 +747,47 @@ def cmd_proxy(args):
         print(f"  {C.GRAY}Or run directly: uvicorn entroly.proxy:app --port {config.port}{C.RESET}")
     except KeyboardInterrupt:
         print(f"\n  {C.GRAY}Proxy stopped.{C.RESET}")
+
+
+def cmd_daemon(args):
+    """entroly daemon — start the unified supervisor process."""
+    if getattr(args, "debug", False):
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s [entroly:%(name)s] %(levelname)s %(message)s",
+            stream=sys.stderr,
+            force=True,
+        )
+
+    from entroly.daemon import EntrolyDaemon, _install_log_buffer
+
+    _install_log_buffer()
+
+    print(f"""
+{C.CYAN}{C.BOLD}  Entroly Daemon — Unified Supervisor{C.RESET}
+{C.GRAY}  Single process managing proxy, dashboard, MCP, learning{C.RESET}
+""")
+
+    daemon = EntrolyDaemon(
+        proxy_port=getattr(args, "proxy_port", 9377),
+        dashboard_port=getattr(args, "dashboard_port", 9378),
+        host=getattr(args, "host", "127.0.0.1"),
+        enable_proxy=not getattr(args, "no_proxy", False),
+        quality=getattr(args, "quality", "balanced") or "balanced",
+    )
+
+    daemon.start()
+
+    print(f"""
+  {C.GREEN}{C.BOLD}Daemon running{C.RESET}
+    Proxy:     http://localhost:{daemon.state.proxy.port}
+    Dashboard: http://localhost:{daemon.state.dashboard.port}
+    Control:   http://localhost:{daemon.state.dashboard.port}/api/control/status
+
+  {C.GRAY}Press Ctrl+C to stop all services.{C.RESET}
+""")
+
+    daemon.run_forever()
 
 
 def cmd_benchmark(args):
@@ -1225,6 +1273,46 @@ def cmd_batch(args):
 # ── Wrap: One-command agent launcher ─────────────────────────────────
 
 
+def _check_codebase() -> bool:
+    """Check if we're in a directory that looks like a codebase.
+
+    Returns True if codebase detected, False with warning if not.
+    """
+    cwd = os.getcwd()
+    indicators = [
+        "pyproject.toml", "setup.py", "requirements.txt", "Pipfile",
+        "Cargo.toml", "package.json", "go.mod", "pom.xml", "build.gradle",
+        "Gemfile", "tsconfig.json", ".git", "Makefile", "CMakeLists.txt",
+    ]
+    for f in indicators:
+        if os.path.exists(os.path.join(cwd, f)):
+            return True
+
+    # Count source files as fallback
+    source_exts = {".py", ".js", ".ts", ".rs", ".go", ".java", ".rb", ".c", ".cpp", ".cs"}
+    source_count = 0
+    for entry in os.listdir(cwd):
+        if os.path.isfile(os.path.join(cwd, entry)):
+            _, ext = os.path.splitext(entry)
+            if ext in source_exts:
+                source_count += 1
+                if source_count >= 3:
+                    return True
+
+    print(f"""
+  {C.YELLOW}{C.BOLD}No codebase detected in: {cwd}{C.RESET}
+
+  {C.GRAY}Entroly works best when run from your project directory.
+  Navigate to your codebase first:{C.RESET}
+
+    {C.CYAN}cd /path/to/your/project{C.RESET}
+    {C.CYAN}entroly go{C.RESET}
+
+  {C.GRAY}Supported: Python, JS/TS, Rust, Go, Java, Ruby, C/C++, and more.{C.RESET}
+""")
+    return False
+
+
 _WRAP_AGENTS = {
     "claude": {
         "cmd": ["claude"],
@@ -1270,6 +1358,11 @@ def cmd_wrap(args):
         print(f"\n  {C.RED}Unknown agent: {agent}{C.RESET}")
         print(f"  {C.GRAY}Supported: {', '.join(_WRAP_AGENTS.keys())}{C.RESET}\n")
         return
+
+    # Check codebase presence
+    if not _check_codebase():
+        if not getattr(args, 'force', False):
+            return
 
     spec = _WRAP_AGENTS[agent]
     port = args.port
@@ -1330,6 +1423,13 @@ def cmd_wrap(args):
     env[spec["env_key"]] = spec["env_val"].format(port=port)
     print(f"  {C.GRAY}Set {spec['env_key']}={spec['env_val'].format(port=port)}{C.RESET}")
     print(f"  {C.GREEN}Launching {spec['name']}...{C.RESET}\n")
+
+    # Auto-open dashboard
+    try:
+        import webbrowser
+        webbrowser.open("http://localhost:9378")
+    except Exception:
+        pass
 
     try:
         import shutil
@@ -1472,6 +1572,11 @@ def cmd_go(args):
 {C.CYAN}{C.BOLD}  ⚡ Entroly Go{C.RESET} — full setup in one command
 """)
 
+    # Step 0: Codebase check
+    if not _check_codebase():
+        if not getattr(args, 'force', False):
+            return
+
     # Step 1: Detect project
     project = _detect_project_type()
     langs = ', '.join(project['languages'])
@@ -1544,6 +1649,13 @@ def cmd_go(args):
   {C.GRAY}Every request: intercepted → optimized → forwarded. Live latency on the dashboard.{C.RESET}
   {C.GRAY}Press Ctrl+C to stop.{C.RESET}
 """)
+
+    # Auto-open dashboard
+    try:
+        import webbrowser
+        webbrowser.open("http://localhost:9378")
+    except Exception:
+        pass
 
     try:
         import uvicorn
@@ -3539,6 +3651,18 @@ def main():
         help="Override RAVS event log path",
     )
 
+    # ── daemon command ─────────────────────────────────────────────
+    daemon_parser = subparsers.add_parser(
+        "daemon",
+        help="Start unified supervisor (proxy + dashboard + MCP + learning)",
+    )
+    daemon_parser.add_argument("--proxy-port", type=int, default=9377, help="Proxy port")
+    daemon_parser.add_argument("--dashboard-port", type=int, default=9378, help="Dashboard port")
+    daemon_parser.add_argument("--host", type=str, default="127.0.0.1", help="Bind host")
+    daemon_parser.add_argument("--no-proxy", action="store_true", help="Skip proxy server")
+    daemon_parser.add_argument("--quality", type=str, default="balanced", help="Quality mode: fast/balanced/max")
+    daemon_parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+
     args = parser.parse_args()
 
     # First-run welcome + update check (non-blocking)
@@ -3582,6 +3706,7 @@ def main():
         "learn": cmd_learn,
         "share": cmd_share,
         "ravs": cmd_ravs,
+        "daemon": cmd_daemon,
     }
 
     handler = _dispatch.get(args.command)

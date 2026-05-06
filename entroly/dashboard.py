@@ -455,7 +455,11 @@ tr:hover td{background:rgba(255,255,255,0.015);}
 <body>
 <div class="topbar">
   <div class="brand"><h1>⚡ Entroly</h1><span class="btag">INTELLIGENCE DASHBOARD</span></div>
-  <div class="live"><div class="dot"></div>Live · 3s refresh</div>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <a href="/" style="color:var(--emerald);text-decoration:none;font-size:13px;font-weight:600;">Dashboard</a>
+    <a href="/controls" style="color:var(--dim);text-decoration:none;font-size:13px;font-weight:500;transition:color .2s;" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--dim)'">⚙️ Controls</a>
+    <div class="live"><div class="dot"></div>Live · 3s refresh</div>
+  </div>
 </div>
 <div class="main">
   <div class="whisper" id="whisper">
@@ -783,7 +787,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         """Add security headers to prevent clickjacking and MIME sniffing."""
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'")
+        self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; font-src https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com")
         self.send_header("Referrer-Policy", "no-referrer")
 
     def do_GET(self):
@@ -794,6 +798,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_security_headers()
             self.end_headers()
             self.wfile.write(DASHBOARD_HTML.encode())
+        elif self.path == "/controls":
+            from entroly.controls_html import CONTROLS_HTML
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self._send_security_headers()
+            self.end_headers()
+            self.wfile.write(CONTROLS_HTML.encode())
         elif self.path == "/api/metrics":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -835,9 +847,163 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_security_headers()
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
+        elif self.path == "/api/control/status":
+            self._handle_control_get("status")
+        elif self.path == "/api/control/repos":
+            self._handle_control_get("repos")
+        elif self.path == "/api/control/learning":
+            self._handle_control_get("learning")
+        elif self.path == "/api/control/federation":
+            self._handle_control_get("federation")
+        elif self.path == "/api/control/context/last":
+            self._handle_control_get("context_last")
+        elif self.path == "/api/control/logs":
+            self._handle_control_get("logs")
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_POST(self):
+        """Handle Control API POST requests."""
+        from entroly.daemon import get_daemon
+        daemon = get_daemon()
+
+        # Read POST body
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = {}
+        if content_length > 0:
+            raw = self.rfile.read(content_length)
+            try:
+                body = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                body = {}
+
+        result = {"ok": False, "error": "unknown route"}
+        status_code = 404
+
+        if daemon is None:
+            # Daemon not running — control API unavailable
+            result = {"ok": False, "error": "daemon not running (use `entroly daemon` to start)"}
+            status_code = 503
+        elif self.path == "/api/control/optimization/enable":
+            daemon.set_optimization(True)
+            result = {"ok": True, "optimization": True}
+            status_code = 200
+        elif self.path == "/api/control/optimization/pause":
+            daemon.set_optimization(False)
+            result = {"ok": True, "optimization": False}
+            status_code = 200
+        elif self.path == "/api/control/bypass":
+            enabled = body.get("enabled", True)
+            daemon.set_bypass(enabled)
+            result = {"ok": True, "bypass": enabled}
+            status_code = 200
+        elif self.path == "/api/control/quality":
+            mode = body.get("mode", "balanced")
+            try:
+                daemon.set_quality(mode)
+                result = {"ok": True, "quality": mode}
+                status_code = 200
+            except ValueError as e:
+                result = {"ok": False, "error": str(e)}
+                status_code = 400
+        elif self.path == "/api/control/repos/reindex":
+            path = body.get("path")
+            daemon.reindex_repo(path)
+            result = {"ok": True, "reindexed": path or "all"}
+            status_code = 200
+        elif self.path == "/api/control/learning/enable":
+            enabled = body.get("enabled", True)
+            daemon.state.learning_enabled = enabled
+            result = {"ok": True, "learning_enabled": enabled}
+            status_code = 200
+        elif self.path == "/api/control/learning/reset":
+            daemon.reset_learning()
+            result = {"ok": True, "weights_reset": True}
+            status_code = 200
+        elif self.path == "/api/control/learning/autotune":
+            daemon.state.autotune_enabled = True
+            result = {"ok": True, "autotune": "triggered"}
+            status_code = 200
+        elif self.path == "/api/control/federation/enable":
+            daemon.state.federation_enabled = True
+            daemon.state.federation_mode = body.get("mode", "anonymous")
+            result = {"ok": True, "federation": daemon.state.federation_mode}
+            status_code = 200
+        elif self.path == "/api/control/federation/disable":
+            daemon.state.federation_enabled = False
+            daemon.state.federation_mode = "off"
+            result = {"ok": True, "federation": "off"}
+            status_code = 200
+        elif self.path == "/api/control/stop":
+            result = {"ok": True, "status": "stopping"}
+            status_code = 200
+            # Schedule stop after response
+            import threading
+            threading.Thread(
+                target=lambda: (
+                    __import__("time").sleep(0.5), daemon.stop()
+                ),
+                daemon=True,
+            ).start()
+
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "http://localhost:9378")
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps(result).encode())
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight for control API."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "http://localhost:9378")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def _handle_control_get(self, key: str):
+        """Handle a control API GET request."""
+        from entroly.daemon import get_daemon
+        daemon = get_daemon()
+
+        if daemon is None:
+            data = {"error": "daemon not running", "hint": "use `entroly daemon` to start"}
+        elif key == "status":
+            data = daemon.state.to_dict()
+        elif key == "repos":
+            data = {"repos": [
+                {"path": r.path, "watching": r.watching,
+                 "indexed_files": r.indexed_files,
+                 "total_tokens": r.total_tokens,
+                 "last_sync": r.last_sync}
+                for r in daemon.state.repos
+            ]}
+        elif key == "learning":
+            data = {
+                "local_enabled": daemon.state.learning_enabled,
+                "autotune_enabled": daemon.state.autotune_enabled,
+                "weights": daemon.get_learning_weights(),
+            }
+        elif key == "federation":
+            data = {
+                "enabled": daemon.state.federation_enabled,
+                "mode": daemon.state.federation_mode,
+            }
+        elif key == "context_last":
+            data = daemon.get_last_context()
+        elif key == "logs":
+            data = {"lines": daemon.get_logs(100)}
+        else:
+            data = {"error": f"unknown key: {key}"}
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "http://localhost:9378")
+        self.send_header("Cache-Control", "no-cache")
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps(data, default=str).encode())
 
 
 def start_dashboard(engine: Any = None, port: int = 9378, daemon: bool = True):

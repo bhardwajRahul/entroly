@@ -2396,18 +2396,21 @@ async def _proxy_stats(request: Request) -> JSONResponse:
 
 
 def create_proxy_app(
-    engine: Any, config: ProxyConfig | None = None
+    engine: Any, config: ProxyConfig | None = None,
+    start_dashboard: bool = True,
 ) -> Starlette:
     """Create the Starlette ASGI app for the prompt compiler proxy."""
     proxy = PromptCompilerProxy(engine, config)
 
     # Auto-start the live value dashboard alongside the proxy
-    try:
-        from .dashboard import start_dashboard
-        start_dashboard(engine=engine, port=9378, daemon=True)
-        logger.info("Value dashboard live at http://localhost:9378")
-    except Exception as e:
-        logger.warning(f"Dashboard failed to start: {e}")
+    # (skipped when called from the daemon, which starts its own dashboard)
+    if start_dashboard:
+        try:
+            from .dashboard import start_dashboard as _start_dash
+            _start_dash(engine=engine, port=9378, daemon=True)
+            logger.info("Value dashboard live at http://localhost:9378")
+        except Exception as e:
+            logger.warning(f"Dashboard failed to start: {e}")
 
     # Start the autotune RL daemon — continuously improves weights in background.
     # Lazy import to avoid circular dependency (server.py ↔ proxy.py).
