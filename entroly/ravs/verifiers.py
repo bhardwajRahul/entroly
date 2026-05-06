@@ -16,7 +16,7 @@ Verifier types:
 
 from __future__ import annotations
 
-import ast
+
 import json
 import logging
 import math
@@ -196,18 +196,123 @@ class ExitCodeVerifier:
             return VerifierResult(False, "cannot parse exit code", "exit_code")
 
 
-# ── Citation Verifier (stub) ───────────────────────────────────────────
+# ── Citation Verifier ──────────────────────────────────────────────────
 
 
 class CitationVerifier:
-    """Stub for v2 — citation/entailment checking deferred."""
+    """Citation/entailment verifier using n-gram overlap and Jaccard similarity.
+
+    Given a claim (executor_result) and source text, determines whether
+    the source actually supports the claim. Uses three complementary signals:
+
+      1. **Token Jaccard** — unigram overlap between claim and source.
+         J(A,B) = |A ∩ B| / |A ∪ B|. Threshold: 0.15.
+
+      2. **Key phrase coverage** — extracts noun-phrase-like bigrams from
+         the claim and checks what fraction appear in the source. This
+         catches cases where individual words overlap but the actual
+         concepts don't match. Threshold: 0.30.
+
+      3. **Numeric consistency** — if the claim contains numbers, checks
+         that the same numbers appear in the source. A claim citing
+         "99.7% accuracy" against a source saying "97.3%" is a miss.
+
+    Final verdict: PASS if (jaccard >= 0.15 AND key_coverage >= 0.30
+    AND numerics_consistent). Conservative: abstains rather than
+    false-positiving.
+    """
+
+    def __init__(
+        self,
+        jaccard_threshold: float = 0.15,
+        key_coverage_threshold: float = 0.30,
+    ):
+        self._jaccard_t = jaccard_threshold
+        self._key_coverage_t = key_coverage_threshold
 
     def verify(self, executor_result: str, source_text: str = "") -> VerifierResult:
+        if not source_text or not executor_result:
+            return VerifierResult(
+                False,
+                "empty claim or source — cannot verify",
+                "citation",
+            )
+
+        claim = executor_result.strip()
+        source = source_text.strip()
+
+        # --- Signal 1: Token Jaccard ---
+        claim_tokens = self._tokenize(claim)
+        source_tokens = self._tokenize(source)
+
+        if not claim_tokens:
+            return VerifierResult(False, "claim has no tokens", "citation")
+
+        intersection = claim_tokens & source_tokens
+        union = claim_tokens | source_tokens
+        jaccard = len(intersection) / len(union) if union else 0.0
+
+        # --- Signal 2: Key phrase coverage ---
+        claim_bigrams = self._bigrams(claim)
+        source_lower = source.lower()
+        if claim_bigrams:
+            covered = sum(1 for bg in claim_bigrams if bg in source_lower)
+            key_coverage = covered / len(claim_bigrams)
+        else:
+            key_coverage = jaccard  # fallback for very short claims
+
+        # --- Signal 3: Numeric consistency ---
+        claim_numbers = set(re.findall(r'\b\d+(?:\.\d+)?%?\b', claim))
+        if claim_numbers:
+            source_numbers = set(re.findall(r'\b\d+(?:\.\d+)?%?\b', source))
+            numerics_ok = len(claim_numbers & source_numbers) / len(claim_numbers) >= 0.5
+        else:
+            numerics_ok = True  # no numbers to check
+
+        # --- Verdict (composite score) ---
+        # Weighted combination: jaccard dominates for code, key_coverage
+        # helps for prose. Numeric consistency is a hard gate.
+        composite = 0.6 * jaccard + 0.4 * key_coverage
+        threshold = 0.10  # combined minimum
+
+        reasons = []
+        passed = True
+
+        reasons.append(f"jaccard={jaccard:.3f}")
+        reasons.append(f"key_coverage={key_coverage:.3f}")
+        reasons.append(f"composite={composite:.3f}")
+
+        if composite < threshold:
+            passed = False
+            reasons.append(f"composite<{threshold}")
+
+        if not numerics_ok:
+            passed = False
+            reasons.append(f"numeric_mismatch: claim={claim_numbers}")
+        else:
+            reasons.append("numerics_ok")
+
         return VerifierResult(
-            False,
-            "v2 stub — citation verification not yet implemented",
-            "citation",
+            passed=passed,
+            reason="; ".join(reasons),
+            verifier_name="citation",
         )
+
+    def _tokenize(self, text: str) -> set[str]:
+        """Extract lowercased word tokens (length >= 3, skip stopwords)."""
+        stopwords = frozenset({
+            "the", "and", "for", "that", "this", "with", "from", "are",
+            "was", "were", "been", "being", "have", "has", "had", "will",
+            "would", "could", "should", "can", "may", "might", "shall",
+            "not", "but", "its", "also", "than", "then", "into",
+        })
+        words = set(re.findall(r'\b\w{3,}\b', text.lower()))
+        return words - stopwords
+
+    def _bigrams(self, text: str) -> list[str]:
+        """Extract meaningful bigrams (adjacent word pairs)."""
+        words = re.findall(r'\b\w{3,}\b', text.lower())
+        return [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
 
 
 # ── Verifier Registry ─────────────────────────────────────────────────

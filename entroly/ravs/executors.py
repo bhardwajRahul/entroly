@@ -18,9 +18,12 @@ Executor types:
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import math
+import os
 import re
+import subprocess
 import time
 from typing import Any
 
@@ -340,58 +343,292 @@ class ASTExecutor:
         })
 
 
-# ── Stubs for v2 ───────────────────────────────────────────────────────
-# These record intent but don't execute in shadow. Full execution
-# requires sandbox infrastructure (V3+).
 
 
-class TestRunnerStub:
-    """Records test execution intent. Does not actually run tests in v2."""
+class TestRunnerExecutor:
+    """Sandboxed test execution via subprocess.
+
+    Runs test commands (pytest, cargo test, npm test, go test) in a
+    subprocess with:
+      - Hard timeout (default 30s)
+      - Working directory isolation
+      - Stdout/stderr capture
+      - Exit code verification
+
+    Parses output to extract pass/fail counts where possible.
+
+    Security: uses subprocess with shell=False. No user-controlled
+    command injection — the test framework is selected by pattern
+    matching on the input, not passed through.
+    """
+
+    # Supported test frameworks and their commands
+    _FRAMEWORKS: list[tuple[re.Pattern, list[str]]] = [
+        (re.compile(r'\bpytest\b|\bpython.*test', re.I),
+         ["python", "-m", "pytest", "--tb=short", "-q"]),
+        (re.compile(r'\bcargo\s+test\b', re.I),
+         ["cargo", "test", "--", "--nocapture"]),
+        (re.compile(r'\bnpm\s+test\b|\bjest\b|\bvitest\b', re.I),
+         ["npm", "test", "--", "--reporter=verbose"]),
+        (re.compile(r'\bgo\s+test\b', re.I),
+         ["go", "test", "-v", "./..."]),
+        (re.compile(r'\brspec\b', re.I),
+         ["bundle", "exec", "rspec", "--format", "documentation"]),
+    ]
+
+    # Patterns to extract test counts from output
+    _RESULT_PATTERNS: list[tuple[re.Pattern, str]] = [
+        # pytest: "5 passed, 1 failed"
+        (re.compile(r'(\d+)\s+passed'), "passed"),
+        (re.compile(r'(\d+)\s+failed'), "failed"),
+        (re.compile(r'(\d+)\s+error'), "errors"),
+        # cargo test: "test result: ok. 5 passed; 0 failed"
+        (re.compile(r'test result:.*?(\d+)\s+passed;\s*(\d+)\s+failed'), "cargo"),
+        # jest/vitest: "Tests: 2 passed, 1 failed"
+        (re.compile(r'Tests:\s*(\d+)\s+passed'), "passed"),
+        (re.compile(r'Tests:.*?(\d+)\s+failed'), "failed"),
+    ]
+
+    def __init__(self, timeout_s: float = 30.0, cwd: str | None = None):
+        self._timeout = timeout_s
+        self._cwd = cwd
 
     def execute(self, input_text: str) -> ExecutorResult:
-        return ExecutorResult(
-            result=json.dumps({
-                "status": "shadow_stub",
-                "intent": "test_execution",
-                "input": input_text[:200],
-                "note": "v2 shadow mode — test execution recorded, not run",
-            }),
-            succeeded=False,  # not actually executed
-            executor_name="test_runner_stub",
+        t0 = time.perf_counter()
+
+        # Match test framework
+        cmd = None
+        for pattern, base_cmd in self._FRAMEWORKS:
+            if pattern.search(input_text):
+                cmd = list(base_cmd)
+                break
+
+        if cmd is None:
+            # Default: try running the input as a pytest invocation
+            cmd = ["python", "-m", "pytest", "--tb=short", "-q"]
+
+        # Extract specific test file/path if mentioned
+        file_match = re.search(
+            r'(?:tests?/\S+\.py|test_\S+\.py|\S+_test\.py|\S+\.spec\.\w+)',
+            input_text,
         )
+        if file_match:
+            cmd.append(file_match.group(0))
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self._timeout,
+                cwd=self._cwd or os.getcwd(),
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+
+            # Parse results
+            output = proc.stdout + "\n" + proc.stderr
+            parsed = self._parse_results(output, proc.returncode)
+            elapsed = (time.perf_counter() - t0) * 1000
+
+            return ExecutorResult(
+                result=json.dumps(parsed),
+                succeeded=proc.returncode == 0,
+                error="" if proc.returncode == 0 else f"exit_code={proc.returncode}",
+                execution_time_ms=round(elapsed, 2),
+                executor_name="test_runner",
+            )
+
+        except subprocess.TimeoutExpired:
+            elapsed = (time.perf_counter() - t0) * 1000
+            return ExecutorResult(
+                result=json.dumps({
+                    "exit_code": -1,
+                    "error": f"timeout after {self._timeout}s",
+                    "passed": 0, "failed": 0,
+                }),
+                succeeded=False,
+                error=f"timeout after {self._timeout}s",
+                execution_time_ms=round(elapsed, 2),
+                executor_name="test_runner",
+            )
+        except FileNotFoundError as e:
+            elapsed = (time.perf_counter() - t0) * 1000
+            return ExecutorResult(
+                error=f"command not found: {e}",
+                execution_time_ms=round(elapsed, 2),
+                executor_name="test_runner",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - t0) * 1000
+            return ExecutorResult(
+                error=str(e)[:200],
+                execution_time_ms=round(elapsed, 2),
+                executor_name="test_runner",
+            )
+
+    def _parse_results(self, output: str, exit_code: int) -> dict[str, Any]:
+        """Extract structured test results from raw output."""
+        result: dict[str, Any] = {
+            "exit_code": exit_code,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "output_tail": output[-500:] if len(output) > 500 else output,
+        }
+
+        for pattern, label in self._RESULT_PATTERNS:
+            m = pattern.search(output)
+            if m:
+                if label == "cargo":
+                    result["passed"] = int(m.group(1))
+                    result["failed"] = int(m.group(2))
+                elif label in result:
+                    result[label] = max(result[label], int(m.group(1)))
+
+        return result
 
 
-class RetrievalStub:
-    """Records retrieval intent. Citation checking deferred to V3."""
+# ── Retrieval Executor ─────────────────────────────────────────────────
 
-    def execute(self, input_text: str) -> ExecutorResult:
-        return ExecutorResult(
-            result=json.dumps({
-                "status": "shadow_stub",
-                "intent": "retrieval_claim",
-                "input": input_text[:200],
-                "note": "v2 shadow mode — retrieval recorded, not executed",
-            }),
-            succeeded=False,
-            executor_name="retrieval_stub",
-        )
+
+class RetrievalExecutor:
+    """TF-IDF based retrieval for citation verification.
+
+    Given a query, retrieves the most relevant fragments from a provided
+    corpus using term frequency-inverse document frequency scoring with
+    cosine similarity ranking.
+
+    This is the retrieval half of the citation pipeline; the CitationVerifier
+    checks whether retrieved content actually supports the claim.
+    """
+
+    def __init__(self, max_results: int = 5):
+        self._max_results = max_results
+
+    def execute(
+        self,
+        input_text: str,
+        corpus: list[dict[str, str]] | None = None,
+    ) -> ExecutorResult:
+        """Retrieve relevant fragments from corpus.
+
+        Args:
+            input_text: The query/claim to find support for.
+            corpus: List of {"id": str, "content": str} dicts.
+        """
+        t0 = time.perf_counter()
+
+        if not corpus:
+            elapsed = (time.perf_counter() - t0) * 1000
+            return ExecutorResult(
+                result=json.dumps({"matches": [], "query": input_text[:100]}),
+                succeeded=True,
+                execution_time_ms=round(elapsed, 2),
+                executor_name="retrieval",
+            )
+
+        try:
+            matches = self._tfidf_rank(input_text, corpus)
+            elapsed = (time.perf_counter() - t0) * 1000
+            return ExecutorResult(
+                result=json.dumps({
+                    "matches": matches[:self._max_results],
+                    "total_corpus": len(corpus),
+                    "query": input_text[:100],
+                }),
+                succeeded=True,
+                execution_time_ms=round(elapsed, 2),
+                executor_name="retrieval",
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter() - t0) * 1000
+            return ExecutorResult(
+                error=str(e)[:200],
+                execution_time_ms=round(elapsed, 2),
+                executor_name="retrieval",
+            )
+
+    def _tokenize(self, text: str) -> list[str]:
+        """Simple whitespace + punctuation tokenizer."""
+        return re.findall(r'\b\w{2,}\b', text.lower())
+
+    def _tfidf_rank(
+        self,
+        query: str,
+        corpus: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
+        """Rank corpus documents by TF-IDF cosine similarity to query."""
+        import math as _math
+
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+
+        # Build document frequency
+        doc_tokens: list[list[str]] = []
+        for doc in corpus:
+            tokens = self._tokenize(doc.get("content", ""))
+            doc_tokens.append(tokens)
+
+        n_docs = len(corpus)
+        # Document frequency for each term
+        df: dict[str, int] = {}
+        for tokens in doc_tokens:
+            for term in set(tokens):
+                df[term] = df.get(term, 0) + 1
+
+        # IDF: log(N / df(t)) with smoothing
+        idf: dict[str, float] = {}
+        for term, freq in df.items():
+            idf[term] = _math.log((n_docs + 1) / (freq + 1)) + 1.0
+
+        # Query TF-IDF vector
+        query_tf: dict[str, float] = {}
+        for t in query_tokens:
+            query_tf[t] = query_tf.get(t, 0) + 1.0
+        query_vec: dict[str, float] = {}
+        for t, tf in query_tf.items():
+            query_vec[t] = tf * idf.get(t, 1.0)
+
+        # Score each document
+        results: list[dict[str, Any]] = []
+        for i, tokens in enumerate(doc_tokens):
+            doc_tf: dict[str, float] = {}
+            for t in tokens:
+                doc_tf[t] = doc_tf.get(t, 0) + 1.0
+            doc_vec: dict[str, float] = {}
+            for t, tf in doc_tf.items():
+                doc_vec[t] = tf * idf.get(t, 1.0)
+
+            # Cosine similarity
+            dot = sum(query_vec.get(t, 0) * doc_vec.get(t, 0) for t in query_vec)
+            norm_q = _math.sqrt(sum(v * v for v in query_vec.values()))
+            norm_d = _math.sqrt(sum(v * v for v in doc_vec.values()))
+            similarity = dot / (norm_q * norm_d) if norm_q > 0 and norm_d > 0 else 0.0
+
+            if similarity > 0.01:
+                results.append({
+                    "id": corpus[i].get("id", str(i)),
+                    "similarity": round(similarity, 4),
+                    "preview": corpus[i].get("content", "")[:150],
+                })
+
+        results.sort(key=lambda x: x["similarity"], reverse=True)
+        return results
 
 
 # ── Executor Registry ─────────────────────────────────────────────────
 
 
-import json  # noqa: E402 (used in ASTExecutor)
-
-
 class ExecutorRegistry:
     """Central registry mapping executor types to implementations."""
 
-    def __init__(self):
+    def __init__(self, test_cwd: str | None = None):
         self._sympy = SymPyExecutor()
         self._python = PythonExecutor()
         self._ast = ASTExecutor()
-        self._test = TestRunnerStub()
-        self._retrieval = RetrievalStub()
+        self._test = TestRunnerExecutor(cwd=test_cwd)
+        self._retrieval = RetrievalExecutor()
 
     def get(self, executor_type: str) -> Any:
         return {
@@ -419,6 +656,8 @@ class ExecutorRegistry:
         try:
             if executor_type == "ast" and "source_code" in kwargs:
                 return executor.execute(input_text, kwargs["source_code"])
+            if executor_type == "retrieval" and "corpus" in kwargs:
+                return executor.execute(input_text, kwargs["corpus"])
             return executor.execute(input_text)
         except Exception as e:
             return ExecutorResult(

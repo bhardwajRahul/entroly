@@ -291,10 +291,22 @@ def test_r16_shadow_v1_all_stubs_insufficient_data():
         current_model="gpt-4o-mini",
         candidates=["gpt-4o-mini", "gpt-4o"],
     )
-    # 4 default policies, all return insufficient_data
+    # 4 default policies
     assert len(recs) == 4
-    assert all(r["insufficient_data"] for r in recs.values())
-    assert all(r["model"] is None for r in recs.values())
+
+    # current_heuristic is deterministic — it always makes a recommendation
+    # (never returns insufficient_data because it needs no training data)
+    assert not recs["current_heuristic"]["insufficient_data"]
+    assert recs["current_heuristic"]["model"] is not None
+
+    # Learned policies (bucket_beta, embedding_knn, logistic_failure_predictor)
+    # return insufficient_data when cold (no training observations yet)
+    learned = ["bucket_beta", "embedding_knn", "logistic_failure_predictor"]
+    for name in learned:
+        assert recs[name]["insufficient_data"], (
+            f"{name} should return insufficient_data when cold, got: {recs[name]}"
+        )
+        assert recs[name]["model"] is None
 
 
 def test_r17_shadow_agreement_records_abstention():

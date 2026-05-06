@@ -1,10 +1,12 @@
 """
 RAVS — Reasoning Amplification via Verified Scaffolds.
 
-V1: Instrumentation — honest outcome signals, offline evaluation, PRISM bridge.
-V2: Shadow Compiler — decompose requests, execute cheap paths, verify results.
-V3: Guarded Router — evidence-gated, risk-classified, fail-closed routing.
-V4: Sequential Controller — budget-bounded, escalation-aware step execution.
+Production-ready subsystem with four tiers:
+
+  V1: Instrumentation — Honest outcome signals, offline eval, PRISM bridge.
+  V2: Shadow Compiler — Decompose & execute cheap paths (SymPy, AST, TF-IDF retrieval).
+  V3: Guarded Router — Four learned policies (heuristic, Thompson, KNN, logistic).
+  V4: Sequential Controller — Budget-bounded, escalation-aware step execution.
 """
 
 from .events import (
@@ -23,8 +25,14 @@ from .events import (
 from .report import generate_report, format_report_text
 from .outcome_bridge import OutcomeBridge
 from .compiler import PlanCompiler, Plan, PlanNode, NodeKind, detect_substeps
-from .executors import ExecutorRegistry, SymPyExecutor, PythonExecutor, ASTExecutor
-from .verifiers import VerifierRegistry, ExactVerifier, StructuralVerifier
+from .executors import (
+    ExecutorRegistry, SymPyExecutor, PythonExecutor, ASTExecutor,
+    TestRunnerExecutor, RetrievalExecutor,
+)
+from .verifiers import (
+    VerifierRegistry, ExactVerifier, StructuralVerifier, CitationVerifier,
+)
+from .shadow import ShadowEvaluator
 from .shadow_runner import ShadowRunner
 from .router import GuardedRouter, GateStatus, compute_gate_status, classify_risk
 from .controller import SequentialController, ControllerResult, EscalationPolicy
@@ -56,10 +64,14 @@ __all__ = [
     "SymPyExecutor",
     "PythonExecutor",
     "ASTExecutor",
+    "TestRunnerExecutor",
+    "RetrievalExecutor",
     "VerifierRegistry",
     "ExactVerifier",
     "StructuralVerifier",
+    "CitationVerifier",
     "ShadowRunner",
+    "ShadowEvaluator",
     # V3 — Guarded Router
     "GuardedRouter",
     "GateStatus",
