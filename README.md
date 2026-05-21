@@ -65,7 +65,7 @@
   <sub>
     Then <code>cd /your/repo && entroly go</code> — auto-opens the dashboard in your browser.
     <br/>
-    Or: <code>brew tap juyterman1000/entroly && brew install entroly</code> · <code>npm i -g entroly-wasm</code>
+    Or: <code>brew tap juyterman1000/entroly && brew install entroly</code> · <code>npm i -g entroly</code>
     <br/>
     See the <a href="cookbook/README.md"><b>Cookbook</b></a> for 10 concrete recipes,
     or pick your stack from the <a href="#works-with-your-stack">37 wrap targets</a>.
@@ -776,7 +776,7 @@ Architecture, Rust modules, 3-resolution compression, provenance model, RAG comp
 
 <p align="center">
   <b>Measure and reduce wasted context tokens with local, evidence-aware tooling.</b><br/>
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
 </p>
 
 <p align="center">

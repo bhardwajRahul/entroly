@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>Live-Demo →</b></a>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>Live-Demo →</b></a>
 </p>
 
 <p align="center">
@@ -158,5 +158,5 @@ Komprimierung schadet der Genauigkeit nicht — mit Live-API verifiziert (gpt-4o
 
 <p align="center">
   <b>Hör auf, für Tokens zu bezahlen, die deine KI verschwendet. Starte eine KI, die sich selbst lehrt.</b><br/>
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
 </p>

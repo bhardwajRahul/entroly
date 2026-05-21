@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>Canlı demo →</b></a>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>Canlı demo →</b></a>
 </p>
 
 <p align="center">
@@ -158,5 +158,5 @@ Sıkıştırma doğruluğu etkilemez — canlı API ile doğrulandı (gpt-4o-min
 
 <p align="center">
   <b>AI'nızın israf ettiği tokenlar için ödeme yapmayı bırakın. Kendini öğreten bir AI başlatın.</b><br/>
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
 </p>

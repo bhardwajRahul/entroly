@@ -1,4 +1,4 @@
-﻿<p align="center">
+<p align="center">
   <a href="../../README.md">🇬🇧 English</a> •
   <a href="README.ja.md">🇯🇵 日本語</a> •
   <a href="README.ko.md">🇰🇷 한국어</a> •
@@ -35,7 +35,7 @@
 </p>
 
 <p align="center">
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>在线演示 →</b></a>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>在线演示 →</b></a>
 </p>
 
 <p align="center">
@@ -86,7 +86,7 @@
 ## 原理（30秒）
 
 ```bash
-npm install entroly-wasm && npx entroly-wasm
+npm install -g entroly && entroly
 # 或
 pip install entroly && entroly go
 ```
@@ -266,7 +266,7 @@ python -m entroly.integrations.agentskills ./dist/agentskills
 
 <p align="center">
   <b>使用本地、证据感知的工具测量和减少浪费的上下文token。</b><br/>
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
 </p>
 
 <p align="center">

@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>라이브 데모 →</b></a>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>라이브 데모 →</b></a>
 </p>
 
 ---
@@ -94,7 +94,7 @@
 ## 작동 방식 (30초)
 
 ```bash
-npm install entroly-wasm && npx entroly-wasm
+npm install -g entroly && entroly
 # 또는
 pip install entroly && entroly go
 ```
@@ -203,5 +203,5 @@ LLM 응답에는 ~40% 필러가 있습니다. Entroly가 제거합니다. 코드
 
 <p align="center">
   <b>AI가 낭비하는 토큰에 돈을 지불하는 것을 멈추세요. 스스로 배우는 AI를 시작하세요.</b><br/>
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
 </p>

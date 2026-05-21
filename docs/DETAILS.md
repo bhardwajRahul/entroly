@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>npm install entroly-wasm && npx entroly-wasm</code>
+  <code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>npm install -g entroly && entroly</code>
 </p>
 
 <p align="center">
@@ -134,9 +134,18 @@ npx entroly-wasm optimize  # CLI optimizer
 npx entroly-wasm demo      # see savings on YOUR codebase
 ```
 
-The WASM package runs the full Rust engine natively in Node.js — **no Python required**.
+Or use the short compatibility package:
 
-**That's it.** `entroly go` (Python) or `npx entroly-wasm serve` (Node.js) auto-detects your IDE, starts the engine, and begins optimizing. Point your AI tool to `http://localhost:9377/v1`.
+```bash
+npm install -g entroly
+entroly serve
+entroly optimize 8000 "fix the auth bug"
+entroly demo
+```
+
+Both npm packages run the full Rust engine natively in Node.js — **no Python required**.
+
+**That's it.** `entroly go` (Python) or `entroly serve` / `npx entroly-wasm serve` (Node.js) auto-detects your IDE, starts the engine, and begins optimizing. Point your AI tool to `http://localhost:9377/v1`.
 
 ### Or step by step
 
@@ -147,6 +156,10 @@ entroly init                       # detect IDE + generate config
 entroly proxy --quality balanced   # start proxy
 
 # Node.js
+npm install -g entroly             # short alias for the WASM runtime
+entroly serve                      # start MCP server
+
+# Or install the WASM package directly
 npm install entroly-wasm           # WASM engine, zero dependencies
 npx entroly-wasm serve             # start MCP server
 ```
@@ -155,6 +168,7 @@ npx entroly-wasm serve             # start MCP server
 
 | Package | What you get |
 |---------|---|
+| `npm install -g entroly` | Short CLI alias that installs and delegates to `entroly-wasm` |
 | `npm install entroly-wasm` | Full Rust engine via WebAssembly — MCP server, CLI, autotune, health |
 
 ### pip packages

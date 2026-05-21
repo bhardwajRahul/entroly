@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>Demo ao vivo →</b></a>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>Demo ao vivo →</b></a>
 </p>
 
 <p align="center">
@@ -84,7 +84,7 @@ Cada dia que você espera, a diferença cresce. O efeito federação significa q
 ## Como Funciona (30 Segundos)
 
 ```bash
-npm install entroly-wasm && npx entroly-wasm
+npm install -g entroly && entroly
 # ou
 pip install entroly && entroly go
 ```
@@ -170,5 +170,5 @@ A compressão não prejudica a precisão — verificado com API ao vivo (gpt-4o-
 
 <p align="center">
   <b>Pare de pagar pelos tokens que sua IA desperdiça. Comece com uma IA que se ensina sozinha.</b><br/>
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
 </p>

@@ -6,7 +6,7 @@ Scoop manifest for installing entroly on Windows.
 
 Placeholder. Scoop manifest is on the v0.19.x roadmap. Until then, Windows
 users should install via `pip install entroly` (works under PowerShell)
-or `npm i -g entroly-wasm` for the WASM build.
+or `npm i -g entroly` for the WASM build.
 
 ## Submission checklist
 

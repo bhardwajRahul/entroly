@@ -36,7 +36,7 @@
 </p>
 
 <p align="center">
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>ライブデモ →</b></a>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>&nbsp;&nbsp;|&nbsp;&nbsp;<a href="https://juyterman1000.github.io/entroly/"><b>ライブデモ →</b></a>
 </p>
 
 ---
@@ -94,7 +94,7 @@
 ## 仕組み（30秒）
 
 ```bash
-npm install entroly-wasm && npx entroly-wasm
+npm install -g entroly && entroly
 # または
 pip install entroly && entroly go
 ```
@@ -241,7 +241,7 @@ LLM応答には約40%のフィラーが含まれています。Entrolyがそれ�
 
 <p align="center">
   <b>AIが無駄にするトークンの支払いをやめましょう。自分を教えるAIを始めましょう。</b><br/>
-  <code>npm install entroly-wasm && npx entroly-wasm</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
+  <code>npm install -g entroly && entroly</code>&nbsp;&nbsp;|&nbsp;&nbsp;<code>pip install entroly && entroly go</code>
 </p>
 
 <p align="center">
